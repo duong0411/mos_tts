@@ -3,24 +3,9 @@
 
 #include <math.h>
 #include <stdint.h>
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// #region agent log
-static void dbg_log_at(const char *run_id, const char *hypothesis_id, const char *location, const char *message, int a, int b, int c) {
-    FILE *f = fopen("/media/hdd1/duongpv/.cursor/debug-a2d083.log", "a");
-    if (!f) return;
-    long long ts = (long long)time(NULL) * 1000LL;
-    fprintf(
-        f,
-        "{\"sessionId\":\"a2d083\",\"runId\":\"%s\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":{\"a\":%d,\"b\":%d,\"c\":%d},\"timestamp\":%lld}\n",
-        run_id, hypothesis_id, location, message, a, b, c, ts
-    );
-    fclose(f);
-}
-// #endregion
 
 static int parse_json_int_in(const char *start, const char *end, const char *key, int *out) {
     char pat[128];
@@ -64,12 +49,12 @@ static int get_f32_tensor(const safetensors_file_t *sf, const char *name, const 
     return 0;
 }
 
-static void matvec_bias_tanh(float *y, const float *W, const float *b, const float *x, int rows, int cols) {
+static void matvec_bias(float *y, const float *W, const float *b, const float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         const float *wr = W + (size_t)r * cols;
         float s = b ? b[r] : 0.0f;
         for (int c = 0; c < cols; c++) s += wr[c] * x[c];
-        y[r] = tanhf(s);
+        y[r] = s;
     }
 }
 
@@ -355,9 +340,6 @@ int moss_audio_tok_encode_wav(
     int **out_codes,
     int *out_frames
 ) {
-    // #region agent log
-    dbg_log_at("debug-2", "H3", "moss_audio_tok.c:encode_enter", "encode_enter", n_samples, n_channels, tok->cfg.downsample_rate);
-    // #endregion
     (void)tok;
     if (!tok || !pcm || n_samples <= 0 || n_channels <= 0 || !out_codes || !out_frames) return -1;
     float *x0 = NULL, *x1 = NULL, *x2 = NULL, *x3 = NULL, *x4 = NULL, *x5 = NULL, *x6 = NULL, *x7 = NULL, *x8 = NULL;
@@ -367,7 +349,14 @@ int moss_audio_tok_encode_wav(
     const int nq = tok->cfg.num_quantizers > 0 ? tok->cfg.num_quantizers : 16;
     const int hop = tok->cfg.downsample_rate > 0 ? tok->cfg.downsample_rate : 3840;
     const int cb = tok->cfg.codebook_size > 0 ? tok->cfg.codebook_size : 1024;
-    const int frames = (n_samples + hop - 1) / hop;
+    /* Match Python length path:
+       - channel interleave doubles temporal length for stereo
+       - encoder length tracking uses floor divisions (no ceil)
+       => final frame count is floor(n_samples / downsample_rate). */
+    const int frames = n_samples / hop;
+    if (frames <= 0) {
+        return -1;
+    }
     int *codes = (int *)malloc((size_t)frames * (size_t)nq * sizeof(int));
     if (!codes) return -1;
 
@@ -464,20 +453,14 @@ int moss_audio_tok_encode_wav(
     int Tf = 0, Df = 0;
     if (patched_encode_tm(x8, T8, D8, 4, &z768_tm, &Tf, &Df) != 0) { err_step = 30; goto fail; }
     if (Df != 768) { err_step = 31; goto fail; }
-    if (Tf != frames) {
-        /* Keep compatibility with expected frame count from hop. */
-        if (Tf < frames) { err_step = 32; goto fail; }
-    }
-    // #region agent log
-    dbg_log_at("debug-2", "H3", "moss_audio_tok.c:encode_shapes", "encode_shapes", frames, Tf, Df);
-    // #endregion
+    if (Tf < frames) { err_step = 32; goto fail; }
 
     for (int t = 0; t < frames; t++) {
         memcpy(z768, z768_tm + (size_t)t * 768, 768 * sizeof(float));
-        matvec_bias_tanh(z512, q_in_w, q_in_b, z768, 512, 768);
+        matvec_bias(z512, q_in_w, q_in_b, z768, 512, 768);
 
         for (int q = 0; q < nq; q++) {
-            matvec_bias_tanh(e8, q_q_in_w[q], q_q_in_b[q], z512, 8, 512);
+            matvec_bias(e8, q_q_in_w[q], q_q_in_b[q], z512, 8, 512);
             float en = 0.0f;
             for (int i = 0; i < 8; i++) en += e8[i] * e8[i];
             en = sqrtf(en + 1e-12f);
@@ -501,7 +484,7 @@ int moss_audio_tok_encode_wav(
             codes[(size_t)t * nq + q] = best;
 
             const float *cbv = q_q_codebook[q] + (size_t)best * 8;
-            matvec_bias_tanh(zq512, q_q_out_w[q], q_q_out_b[q], cbv, 512, 8);
+            matvec_bias(zq512, q_q_out_w[q], q_q_out_b[q], cbv, 512, 8);
             for (int i = 0; i < 512; i++) z512[i] -= zq512[i];
         }
     }
@@ -518,9 +501,6 @@ int moss_audio_tok_encode_wav(
     return 0;
 
 fail:
-    // #region agent log
-    dbg_log_at("debug-2", "H3", "moss_audio_tok.c:encode_fail", "encode_fail", err_step, n_samples, n_channels);
-    // #endregion
     fprintf(stderr, "[moss_audio_tok] encode_wav failed at step=%d\n", err_step);
     fflush(stderr);
     free(z768_tm);
@@ -548,68 +528,6 @@ static int read_le32(FILE *f, unsigned int *out) {
     return 0;
 }
 
-static int decode_audio_with_ffmpeg(
-    const char *path,
-    int dst_sr,
-    int dst_ch,
-    float **out_pcm,
-    int *out_samples
-) {
-    char cmd[4096];
-    if (snprintf(
-            cmd,
-            sizeof(cmd),
-            "ffmpeg -v error -i \"%s\" -f f32le -ac %d -ar %d - 2>/dev/null",
-            path,
-            dst_ch,
-            dst_sr
-        ) >= (int)sizeof(cmd)) {
-        return -1;
-    }
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    size_t cap = (size_t)dst_sr * (size_t)dst_ch * sizeof(float);
-    if (cap < 4096) cap = 4096;
-    unsigned char *buf = (unsigned char *)malloc(cap);
-    if (!buf) {
-        pclose(p);
-        return -1;
-    }
-    size_t n = 0;
-    for (;;) {
-        if (n + 8192 > cap) {
-            size_t ncap = cap * 2;
-            unsigned char *nb = (unsigned char *)realloc(buf, ncap);
-            if (!nb) {
-                free(buf);
-                pclose(p);
-                return -1;
-            }
-            buf = nb;
-            cap = ncap;
-        }
-        size_t r = fread(buf + n, 1, 8192, p);
-        n += r;
-        if (r == 0) break;
-    }
-    int rc = pclose(p);
-    if (rc != 0 || n < sizeof(float) * (size_t)dst_ch) {
-        free(buf);
-        return -1;
-    }
-    size_t fcount = n / sizeof(float);
-    float *pcm = (float *)malloc(fcount * sizeof(float));
-    if (!pcm) {
-        free(buf);
-        return -1;
-    }
-    memcpy(pcm, buf, fcount * sizeof(float));
-    free(buf);
-    *out_pcm = pcm;
-    *out_samples = (int)(fcount / (size_t)dst_ch);
-    return 0;
-}
-
 int moss_audio_tok_encode_wav_file(
     const moss_audio_tok_t *tok,
     const char *wav_path,
@@ -631,12 +549,10 @@ int moss_audio_tok_encode_wav_file(
     }
     if (memcmp(riff, "RIFF", 4) != 0 || memcmp(wave, "WAVE", 4) != 0) {
         fclose(f);
-        float *ffmpeg_pcm = NULL;
-        int ffmpeg_samples = 0;
-        if (decode_audio_with_ffmpeg(wav_path, dst_sr, dst_ch, &ffmpeg_pcm, &ffmpeg_samples) != 0) return -1;
-        int rc = moss_audio_tok_encode_wav(tok, ffmpeg_pcm, ffmpeg_samples, dst_ch, out_codes, out_frames);
-        free(ffmpeg_pcm);
-        return rc;
+        /* Keep native path deterministic for real WAV PCM only.
+           Compressed/other containers (e.g. FLAC with .wav extension) are delegated
+           to the Python fallback in moss_tts.c to stay bit-consistent with reference. */
+        return -1;
     }
 
     unsigned short audio_format = 1, channels = 1, bits = 16;
@@ -745,12 +661,10 @@ int moss_audio_tok_decode_codes(
     int frames,
     int sample_rate,
     float **out_samples,
-    int *out_n_samples
+    int *out_n_samples,
+    int *out_n_channels
 ) {
-    if (!tok || !tok->sf || !codes || frames <= 0 || sample_rate <= 0 || !out_samples || !out_n_samples) return -1;
-    // #region agent log
-    dbg_log_at("debug-2", "H5", "moss_audio_tok.c:decode_enter", "decode_enter", frames, sample_rate, tok->cfg.sample_rate);
-    // #endregion
+    if (!tok || !tok->sf || !codes || frames <= 0 || sample_rate <= 0 || !out_samples || !out_n_samples || !out_n_channels) return -1;
 
     const int nq = tok->cfg.num_quantizers > 0 ? tok->cfg.num_quantizers : 16;
     const int cb = tok->cfg.codebook_size > 0 ? tok->cfg.codebook_size : 1024;
@@ -758,7 +672,6 @@ int moss_audio_tok_decode_codes(
     float *z768_tm = NULL;
     float *x1 = NULL, *x2 = NULL, *x3 = NULL, *x4 = NULL, *x5 = NULL, *x6 = NULL, *x7 = NULL, *x8 = NULL;
     float *wav_interleave = NULL;
-    float *mono_model = NULL;
 
     const float *q_out_g = NULL, *q_out_v = NULL, *q_out_b = NULL;
     int64_t n = 0;
@@ -802,11 +715,11 @@ int moss_audio_tok_decode_codes(
             if (id < 0) id = 0;
             if (id >= cb) id = cb - 1;
             const float *cbv = q_q_codebook[q] + (size_t)id * 8;
-            matvec_bias_tanh(t512, q_q_out_w[q], q_q_out_b[q], cbv, 512, 8);
+            matvec_bias(t512, q_q_out_w[q], q_q_out_b[q], cbv, 512, 8);
             for (int i = 0; i < 512; i++) z512[i] += t512[i];
         }
 
-        matvec_bias_tanh(z768, q_out_w, q_out_b, z512, 768, 512);
+        matvec_bias(z768, q_out_w, q_out_b, z512, 768, 512);
         memcpy(z768_tm + (size_t)t * 768, z768, 768 * sizeof(float));
     }
 
@@ -833,74 +746,47 @@ int moss_audio_tok_decode_codes(
     if (Di != 1) goto fail;
 
     int ch = tok->cfg.channels > 0 ? tok->cfg.channels : 2;
-    int n_model = Ti;
-    if (ch > 1) {
-        int n_m = n_model / ch;
-        mono_model = (float *)malloc((size_t)n_m * sizeof(float));
-        if (!mono_model) goto fail;
-        for (int i = 0; i < n_m; i++) {
-            float s = 0.0f;
-            for (int c = 0; c < ch; c++) s += wav_interleave[i * ch + c];
-            mono_model[i] = 0.3f * (s / (float)ch);
-        }
-        n_model = n_m;
-    } else {
-        mono_model = (float *)malloc((size_t)n_model * sizeof(float));
-        if (!mono_model) goto fail;
-        for (int i = 0; i < n_model; i++) mono_model[i] = 0.3f * wav_interleave[i];
-    }
-    int out_n = (sample_rate == model_sr) ? n_model : (int)((int64_t)n_model * sample_rate / model_sr);
-    if (out_n < 1) out_n = 1;
+    if (ch < 1) ch = 1;
+    int in_frames = Ti / ch;
+    if (in_frames < 1) goto fail;
+    int out_frames = (sample_rate == model_sr) ? in_frames : (int)((int64_t)in_frames * sample_rate / model_sr);
+    if (out_frames < 1) out_frames = 1;
+    int out_n = out_frames * ch;
     float *out = (float *)malloc((size_t)out_n * sizeof(float));
     if (!out) goto fail;
     if (sample_rate == model_sr) {
-        memcpy(out, mono_model, (size_t)out_n * sizeof(float));
+        memcpy(out, wav_interleave, (size_t)out_n * sizeof(float));
     } else {
-        for (int i = 0; i < out_n; i++) {
+        for (int i = 0; i < out_frames; i++) {
             float pos = ((float)i * (float)model_sr) / (float)sample_rate;
             int i0 = (int)pos;
             int i1 = i0 + 1;
             if (i0 < 0) i0 = 0;
-            if (i0 >= n_model) i0 = n_model - 1;
-            if (i1 >= n_model) i1 = n_model - 1;
+            if (i0 >= in_frames) i0 = in_frames - 1;
+            if (i1 >= in_frames) i1 = in_frames - 1;
             float a = pos - (float)i0;
-            out[i] = mono_model[i0] + (mono_model[i1] - mono_model[i0]) * a;
-        }
-    }
-    {
-        float peak = 0.0f;
-        for (int i = 0; i < out_n; i++) {
-            float v = fabsf(out[i]);
-            if (v > peak) peak = v;
-        }
-        /* Normalize quiet outputs to avoid "empty" sounding wav while keeping headroom. */
-        if (peak > 1e-6f) {
-            float target_peak = 0.22f;
-            float gain = target_peak / peak;
-            if (gain < 1.0f) gain = 1.0f;
-            if (gain > 12.0f) gain = 12.0f;
-            for (int i = 0; i < out_n; i++) out[i] *= gain;
+            for (int c = 0; c < ch; c++) {
+                float s0 = wav_interleave[(size_t)i0 * ch + c];
+                float s1 = wav_interleave[(size_t)i1 * ch + c];
+                out[(size_t)i * ch + c] = s0 + (s1 - s0) * a;
+            }
         }
     }
     free(x1); free(x2); free(x3); free(x4); free(x5); free(x6); free(x7); free(x8);
     free(wav_interleave);
-    free(mono_model);
     free(z768_tm);
 
     for (int q = 0; q < nq; q++) free(q_q_out_w[q]);
     free(q_out_w);
     *out_samples = out;
     *out_n_samples = out_n;
-    // #region agent log
-    dbg_log_at("debug-2", "H5", "moss_audio_tok.c:decode_done", "decode_done", n_model, out_n, ch);
-    // #endregion
+    *out_n_channels = ch;
     return 0;
 
 fail:
     free(z768_tm);
     free(x1); free(x2); free(x3); free(x4); free(x5); free(x6); free(x7); free(x8);
     free(wav_interleave);
-    free(mono_model);
     for (int q = 0; q < nq; q++) free(q_q_out_w[q]);
     free(q_out_w);
     return -1;

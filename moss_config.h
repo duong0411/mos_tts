@@ -22,7 +22,6 @@ typedef struct {
     int local_n_layer;
 } moss_run_config_t;
 
-/* Parse ../weight/config.json into cfg. Returns 0 on success. */
 int moss_config_load(const char *model_dir, moss_run_config_t *cfg);
 
 #endif

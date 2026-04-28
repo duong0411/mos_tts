@@ -39,14 +39,15 @@ int moss_audio_tok_encode_wav_file(
     int *out_frames
 );
 
-/* Decode [frames * num_quantizers] codes to mono PCM float samples. */
+/* Decode [frames * num_quantizers] codes to interleaved PCM float samples. */
 int moss_audio_tok_decode_codes(
     const moss_audio_tok_t *tok,
     const int *codes,
     int frames,
     int sample_rate,
     float **out_samples,
-    int *out_n_samples
+    int *out_n_samples,
+    int *out_n_channels
 );
 
 #endif

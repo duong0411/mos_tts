@@ -18,20 +18,6 @@
 #include "moss_kernel.h"
 #include "moss_sp_prompt.h"
 
-// #region agent log
-static void dbg_log_tts(const char *run_id, const char *hypothesis_id, const char *location, const char *message, int a, int b, int c) {
-    FILE *f = fopen("/media/hdd1/duongpv/.cursor/debug-a2d083.log", "a");
-    if (!f) return;
-    long long ts = (long long)time(NULL) * 1000LL;
-    fprintf(
-        f,
-        "{\"sessionId\":\"a2d083\",\"runId\":\"%s\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":{\"a\":%d,\"b\":%d,\"c\":%d},\"timestamp\":%lld}\n",
-        run_id, hypothesis_id, location, message, a, b, c, ts
-    );
-    fclose(f);
-}
-// #endregion
-
 static int has_avx2(void) {
 #ifdef __x86_64__
     unsigned int eax, ebx, ecx, edx;
@@ -126,6 +112,196 @@ static int moss_lm_argmax_bf16(const uint16_t *W, const float *x, int n_cls, int
         }
     }
     return best;
+}
+
+static double moss_rng01(uint64_t *state);
+
+static int cmp_float_desc(const void *a, const void *b) {
+    const float fa = *(const float *)a;
+    const float fb = *(const float *)b;
+    return (fa < fb) - (fa > fb);
+}
+
+static int moss_sample_audio_token_bf16(
+    const uint16_t *W,
+    const float *x,
+    int n_cls,
+    int D,
+    int do_sample,
+    float temperature,
+    int top_k,
+    float top_p,
+    float repetition_penalty,
+    const int *history,
+    int history_len,
+    uint64_t *rng
+) {
+    int best = 0;
+    float bestv = -1e30f;
+    float *logits = (float *)malloc((size_t)n_cls * sizeof(float));
+    if (!logits) return moss_lm_argmax_bf16(W, x, n_cls, D);
+
+    for (int r = 0; r < n_cls; r++) {
+        const uint16_t *wr = W + (size_t)r * D;
+        float s = 0.0f;
+        for (int c = 0; c < D; c++) s += moss_bf16_to_f32(wr[c]) * x[c];
+        logits[r] = s;
+        if (s > bestv) {
+            bestv = s;
+            best = r;
+        }
+    }
+    if (!do_sample) {
+        free(logits);
+        return best;
+    }
+
+    if (repetition_penalty > 1.0f && history && history_len > 0) {
+        unsigned char *seen = (unsigned char *)calloc((size_t)n_cls, 1);
+        if (seen) {
+            for (int i = 0; i < history_len; i++) {
+                int id = history[i];
+                if (id >= 0 && id < n_cls) seen[id] = 1;
+            }
+            for (int i = 0; i < n_cls; i++) {
+                if (!seen[i]) continue;
+                float v = logits[i];
+                logits[i] = (v < 0.0f) ? (v * repetition_penalty) : (v / repetition_penalty);
+            }
+            free(seen);
+        }
+    }
+
+    float T = temperature;
+    if (T < 1e-6f) T = 1e-6f;
+    for (int i = 0; i < n_cls; i++) logits[i] /= T;
+
+    int k = top_k;
+    if (k < 1 || k > n_cls) k = n_cls;
+    float *sorted = (float *)malloc((size_t)n_cls * sizeof(float));
+    if (!sorted) {
+        free(logits);
+        return best;
+    }
+    memcpy(sorted, logits, (size_t)n_cls * sizeof(float));
+    qsort(sorted, (size_t)n_cls, sizeof(float), cmp_float_desc);
+    float kth = sorted[k - 1];
+    free(sorted);
+
+    float m = -1e30f;
+    for (int i = 0; i < n_cls; i++) {
+        if (logits[i] < kth) continue;
+        if (logits[i] > m) m = logits[i];
+    }
+    if (m <= -1e29f) {
+        free(logits);
+        return best;
+    }
+
+    float *probs = (float *)malloc((size_t)n_cls * sizeof(float));
+    if (!probs) {
+        free(logits);
+        return best;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n_cls; i++) {
+        if (logits[i] < kth) {
+            probs[i] = 0.0f;
+            continue;
+        }
+        probs[i] = expf(logits[i] - m);
+        sum += probs[i];
+    }
+    if (sum <= 0.0f) {
+        free(probs);
+        free(logits);
+        return best;
+    }
+    for (int i = 0; i < n_cls; i++) probs[i] /= sum;
+
+    float p = top_p;
+    if (p > 0.0f && p < 1.0f) {
+        float *tmp = (float *)malloc((size_t)n_cls * sizeof(float));
+        if (tmp) {
+            memcpy(tmp, probs, (size_t)n_cls * sizeof(float));
+            qsort(tmp, (size_t)n_cls, sizeof(float), cmp_float_desc);
+            float c = 0.0f;
+            float cut = tmp[n_cls - 1];
+            for (int i = 0; i < n_cls; i++) {
+                c += tmp[i];
+                cut = tmp[i];
+                if (c >= p) break;
+            }
+            free(tmp);
+            float s2 = 0.0f;
+            for (int i = 0; i < n_cls; i++) {
+                if (probs[i] < cut) probs[i] = 0.0f;
+                s2 += probs[i];
+            }
+            if (s2 > 0.0f) {
+                for (int i = 0; i < n_cls; i++) probs[i] /= s2;
+            }
+        }
+    }
+
+    double u = moss_rng01(rng);
+    double acc = 0.0;
+    int picked = best;
+    for (int i = 0; i < n_cls; i++) {
+        acc += probs[i];
+        if (u <= acc) {
+            picked = i;
+            break;
+        }
+    }
+    free(probs);
+    free(logits);
+    return picked;
+}
+
+static uint64_t moss_rng_u64(uint64_t *state) {
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 2685821657736338717ULL;
+}
+
+static double moss_rng01(uint64_t *state) {
+    return (moss_rng_u64(state) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/* Python _sample_next_assistant_text_token: logits restricted to assistant vs end only. */
+static int moss_text_assistant_or_end_pick_bf16(
+    const uint16_t *text_lm_head,
+    const float *x,
+    int D,
+    int assistant_id,
+    int end_id,
+    int do_sample,
+    float text_temperature,
+    uint64_t *rng
+) {
+    float s_ass = 0.0f, s_end = 0.0f;
+    const uint16_t *wa = text_lm_head + (size_t)assistant_id * D;
+    const uint16_t *we = text_lm_head + (size_t)end_id * D;
+    for (int i = 0; i < D; i++) {
+        float xi = x[i];
+        s_ass += moss_bf16_to_f32(wa[i]) * xi;
+        s_end += moss_bf16_to_f32(we[i]) * xi;
+    }
+    if (!do_sample) return (s_ass >= s_end) ? assistant_id : end_id;
+    float T = text_temperature;
+    if (T < 1e-6f) T = 1e-6f;
+    float la = s_ass / T;
+    float lb = s_end / T;
+    float m = la > lb ? la : lb;
+    float ea = expf(la - m);
+    float eb = expf(lb - m);
+    double p_ass = (double)(ea / (ea + eb));
+    double u = moss_rng01(rng);
+    return (u < p_ass) ? assistant_id : end_id;
 }
 
 static int path_looks_like_audio_file(const char *path) {
@@ -299,9 +475,6 @@ int moss_tts_generate_codes(
     int *out_frames
 ) {
     if (!ctx || !text || !params || !out_codes || !out_frames) return -1;
-    // #region agent log
-    dbg_log_tts("debug-2", "H1", "moss_tts.c:generate_enter", "enter", params->max_new_frames, params->sample_rate, 0);
-    // #endregion
     const moss_run_config_t *cfg = &ctx->cfg;
     const moss_weight_bundle_t *w = &ctx->wb;
     const int D = cfg->n_embd;
@@ -309,14 +482,12 @@ int moss_tts_generate_codes(
     const int I = cfg->n_inner;
     const int nvq = cfg->n_vq;
     const int max_frames = params->max_new_frames > 0 ? params->max_new_frames : MOSS_MAX_FRAMES;
+    const int min_frames = params->min_frames > 0 ? params->min_frames : 0;
     if (max_frames > MOSS_MAX_FRAMES) return -1;
 
     int prompt_ids[MOSS_MAX_TEXT_LEN];
     int P = moss_build_prompt_token_ids(ctx->model_dir, cfg, text, prompt_ids, MOSS_MAX_TEXT_LEN);
     if (P < 0) return -2;
-    // #region agent log
-    dbg_log_tts("debug-2", "H1", "moss_tts.c:prompt_len", "prompt_len", P, cfg->audio_assistant_slot_token_id, cfg->audio_end_token_id);
-    // #endregion
     fprintf(stderr, "[moss_tts] prompt_len=%d tokens (SentencePiece + template)\n", P);
     fflush(stderr);
 
@@ -403,6 +574,14 @@ int moss_tts_generate_codes(
     fprintf(stderr, "[moss_tts] starting autoregressive loop (seq grows each frame; long prompts are slow)\n");
     fflush(stderr);
 
+    uint64_t rng = params->rng_seed;
+    if (rng == 0) {
+        rng = (uint64_t)time(NULL);
+        rng ^= (uint64_t)(uintptr_t)out_codes * 1315423911ULL;
+        rng ^= (uint64_t)(uintptr_t)joint * 1181783497276652981ULL;
+        if (rng == 0) rng = 1;
+    }
+
     int frame = 0;
 
     for (; frame < max_frames; frame++) {
@@ -438,23 +617,34 @@ int moss_tts_generate_codes(
             return -8;
         }
 
-        int text_tok = moss_lm_argmax_bf16(w->text_lm_head, loc + (size_t)(S_loc - 1) * D, cfg->vocab_size, D);
-        // #region agent log
-        dbg_log_tts("debug-2", "H2", "moss_tts.c:text_tok", "text_tok", frame + 1, text_tok, cfg->audio_assistant_slot_token_id);
-        // #endregion
-        /* In practice the global text head can emit early end/non-assistant tokens even when
-         * local audio heads still produce valid continuation. Keep generating up to requested
-         * max_frames unless we are already at the last frame.
-         */
-        if (text_tok != cfg->audio_assistant_slot_token_id) {
+        float text_temp = params->text_temperature;
+        if (text_temp <= 0.0f) text_temp = params->temperature > 0.0f ? params->temperature : 1.0f;
+        int text_tok = moss_text_assistant_or_end_pick_bf16(
+            w->text_lm_head,
+            loc + (size_t)(S_loc - 1) * D,
+            D,
+            cfg->audio_assistant_slot_token_id,
+            cfg->audio_end_token_id,
+            params->do_sample != 0,
+            text_temp,
+            &rng
+        );
+        if (text_tok == cfg->audio_end_token_id) {
+            if (frame < min_frames) {
+                text_tok = cfg->audio_assistant_slot_token_id;
+                fprintf(stderr,
+                    "[moss_tts] ignore early end at frame %d (< min_frames=%d), continue\n",
+                    frame + 1, min_frames);
+                fflush(stderr);
+            } else {
             fprintf(stderr,
-                "[moss_tts] force-continue: text_tok=%d -> assistant_slot=%d (frame %d/%d)\n",
-                text_tok,
-                cfg->audio_assistant_slot_token_id,
+                "[moss_tts] stop: text head chose audio_end_token_id=%d (frame %d, do_sample=%d)\n",
+                cfg->audio_end_token_id,
                 frame + 1,
-                max_frames);
+                params->do_sample != 0);
             fflush(stderr);
-            text_tok = cfg->audio_assistant_slot_token_id;
+            break;
+            }
         }
 
         memcpy(loc, h_last, (size_t)D * sizeof(float));
@@ -471,12 +661,28 @@ int moss_tts_generate_codes(
                 free(joint);
                 return -9;
             }
-            int a_tok = moss_lm_argmax_bf16(
+            int *ch_hist = NULL;
+            if (frame > 0) {
+                ch_hist = (int *)malloc((size_t)frame * sizeof(int));
+                if (ch_hist) {
+                    for (int t = 0; t < frame; t++) ch_hist[t] = out_codes[t * cfg->n_vq + ch];
+                }
+            }
+            int a_tok = moss_sample_audio_token_bf16(
                 w->audio_head[ch],
                 loc + (size_t)(S_loc - 1) * D,
                 cfg->audio_vocab_size,
-                D
+                D,
+                params->do_sample != 0,
+                params->audio_temperature,
+                params->audio_top_k,
+                params->audio_top_p,
+                params->audio_repetition_penalty,
+                ch_hist,
+                frame,
+                &rng
             );
+            free(ch_hist);
             out_codes[frame * cfg->n_vq + ch] = a_tok;
             moss_copy_audio_emb_row(w, cfg, ch, loc + (size_t)S_loc * D, a_tok);
             S_loc++;
@@ -488,9 +694,6 @@ int moss_tts_generate_codes(
     }
 
     *out_frames = frame;
-    // #region agent log
-    dbg_log_tts("debug-2", "H4", "moss_tts.c:out_frames", "out_frames", frame, max_frames, 0);
-    // #endregion
     fprintf(stderr, "[moss_tts] done: %d audio frame(s)\n", frame);
     fflush(stderr);
 
@@ -537,8 +740,9 @@ int moss_tts_decode_codes_to_wav(
     return 0;
 }
 
-int moss_write_wav16(const char *path, const float *samples, int n_samples, int sample_rate) {
-    if (!path || !samples || n_samples <= 0 || sample_rate <= 0) return -1;
+int moss_write_wav16(const char *path, const float *samples, int n_samples, int sample_rate, int n_channels) {
+    if (!path || !samples || n_samples <= 0 || sample_rate <= 0 || n_channels <= 0) return -1;
+    if (n_samples % n_channels != 0) return -1;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
 
@@ -563,9 +767,9 @@ int moss_write_wav16(const char *path, const float *samples, int n_samples, int 
     fwrite("fmt ", 1, 4, f);
     uint32_t fmt_chunk = 16;
     uint16_t audio_format = 1;
-    uint16_t num_channels = 1;
-    uint32_t byte_rate = (uint32_t)(sample_rate * sizeof(int16_t));
-    uint16_t block_align = sizeof(int16_t);
+    uint16_t num_channels = (uint16_t)n_channels;
+    uint32_t byte_rate = (uint32_t)(sample_rate * num_channels * sizeof(int16_t));
+    uint16_t block_align = (uint16_t)(num_channels * sizeof(int16_t));
     uint16_t bits = 16;
     fwrite(&fmt_chunk, 4, 1, f);
     fwrite(&audio_format, 2, 1, f);

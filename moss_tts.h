@@ -34,8 +34,16 @@ typedef struct {
 
 typedef struct {
     int max_new_frames;
+    int min_frames;
     int sample_rate;
-    float temperature;
+    float temperature; /* legacy; also used as default for text_temperature if unset elsewhere */
+    int do_sample;       /* 1 = match infer.py default: sample assistant vs end (2-way only) */
+    float text_temperature;
+    float audio_temperature;
+    float audio_top_p;
+    int audio_top_k;
+    float audio_repetition_penalty;
+    unsigned long long rng_seed; /* 0 = seed from time (non-deterministic) */
 } moss_generate_params_t;
 
 moss_tts_ctx_t *moss_tts_load(const char *model_dir, moss_backend_t backend);
@@ -64,7 +72,7 @@ int moss_tts_decode_codes_to_wav(
     int *out_n_samples
 );
 
-int moss_write_wav16(const char *path, const float *samples, int n_samples, int sample_rate);
+int moss_write_wav16(const char *path, const float *samples, int n_samples, int sample_rate, int n_channels);
 
 #ifdef __cplusplus
 }
