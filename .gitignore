@@ -1,0 +1,11 @@
+# Model weights (large safetensors / HF layout — keep local only)
+weight/
+
+# Audio outputs / samples
+*.wav
+
+# Build / local
+*.o
+moss_tts
+moss_tts.exe
+NUL

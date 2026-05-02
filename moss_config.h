@@ -1,6 +1,9 @@
 #ifndef MOSS_CONFIG_H
 #define MOSS_CONFIG_H
 
+/* MOSS-TTS-Nano joint grid uses 1 text column + n_vq audio columns; C loader caps n_vq here. */
+#define MOSS_MAX_NVQ 16
+
 typedef struct {
     int n_vq;
     int n_embd;

@@ -1,6 +1,15 @@
 # MOSS-TTS-Nano C inference (safetensors + SIMD). Prompt text: C++ + libsentencepiece (no Python).
 CC ?= gcc
 CXX ?= g++
+ifeq ($(OS),Windows_NT)
+  # Some Windows environments export CC=cc/CXX=c++ even when only MinGW gcc/g++ exist.
+  ifeq ($(CC),cc)
+    CC := gcc
+  endif
+  ifeq ($(CXX),c++)
+    CXX := g++
+  endif
+endif
 CFLAGS ?= -Wall -Wextra -O3 -march=native -ffast-math
 CXXFLAGS ?= $(CFLAGS)
 
@@ -9,6 +18,8 @@ BLAS_OK := $(shell ldconfig -p 2>/dev/null | grep -Eq "lib(openblas|blas)" && ec
 ifeq ($(BLAS_OK),1)
   CFLAGS += -DMOSS_USE_CBLAS
   CXXFLAGS += -DMOSS_USE_CBLAS
+  # cblas.h + consistent linkage with BLAS_LIBS below
+  CFLAGS += $(shell pkg-config --cflags openblas 2>/dev/null)
 endif
 
 SP_CXXFLAGS := $(shell pkg-config --cflags sentencepiece 2>/dev/null)
@@ -17,9 +28,17 @@ ifeq ($(strip $(SP_LIBS)),)
   SP_LIBS = -lsentencepiece
 endif
 
-BLAS_LIBS := $(shell pkg-config --libs openblas 2>/dev/null)
-ifeq ($(strip $(BLAS_LIBS)),)
-  BLAS_LIBS = -lblas
+# Only link BLAS when MOSS_USE_CBLAS is enabled (see BLAS_OK above).
+BLAS_LIBS :=
+ifeq ($(BLAS_OK),1)
+  BLAS_LIBS := $(shell pkg-config --libs openblas 2>/dev/null)
+  ifeq ($(strip $(BLAS_LIBS)),)
+    ifneq ($(shell ldconfig -p 2>/dev/null | grep -E -c 'libopenblas\.so'),0)
+      BLAS_LIBS := -lopenblas
+    else
+      BLAS_LIBS := -lblas
+    endif
+  endif
 endif
 
 LDLIBS = -lm
@@ -29,6 +48,12 @@ OBJS = $(SRCS:.c=.o) moss_sp_prompt.o
 TARGET = moss_tts
 
 .PHONY: all clean run-example
+
+ifeq ($(OS),Windows_NT)
+  CLEAN_CMD = powershell -NoProfile -Command "Remove-Item -Force -ErrorAction SilentlyContinue *.o,$(TARGET),$(TARGET).exe; exit 0"
+else
+  CLEAN_CMD = rm -f $(OBJS) $(TARGET)
+endif
 
 all: $(TARGET)
 
@@ -42,7 +67,7 @@ moss_sp_prompt.o: moss_sp_prompt.cc moss_sp_prompt.h moss_config.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	$(CLEAN_CMD)
 
 # Default weight dir: sibling ../weight under MOSS-TTS-Nano
 run-example: $(TARGET)

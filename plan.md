@@ -1,145 +1,108 @@
-# Plan: Infer MOSS-TTS-Nano bằng C/C++ + SIMD + Safetensors
+# Plan: Infer MOSS-TTS-Nano bằng C/C++ (không Torch) — LLM + Audio tokenizer + BLAS
 
-Tài liệu này bám **thư mục weights / code tham chiếu** tại  
-`/media/hdd1/duongpv/VibeVoice/MOSS-TTS-Nano/weight/`  
-và binary / thư viện infer trong **`../cpp/`** (cùng repo).
+Tài liệu mô tả **pipeline inference thực tế** trong repo này: đọc weight Hugging Face–style (**safetensors**), chạy **global/local GPT‑2 stacks** và **decoder/encoder Moss Audio Tokenizer** hoàn toàn trong C/C++ + SentencePiece. **PyTorch/ONNX không dùng ở runtime.**
 
-Checkpoint gốc trên Hub: [OpenMOSS-Team/MOSS-TTS-Nano-100M](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M/tree/main).
+**BLAS** (OpenBLAS khi biên dịch với `-DMOSS_USE_CBLAS`) chỉ đóng vai trò **tăng tốc nhân ma trận / dot** (GEMM/GEMV/SDOT); **toàn bộ kiến trúc layer** (attention, softmax, RoPE, GELU, patch, nucleus sampling…) do code tự viết.
 
 ---
 
-## 1. Nội dung folder `weight/` (đã rà soát)
+## 1. Hai khối weight (thư mục `--model-dir`, ví dụ `weight/`)
 
-| File | Vai trò cho infer C/C++ |
-|------|-------------------------|
-| `config.json` | Nguồn sự thật: `gpt2_config` (global), `n_vq`, `vocab_size`, `audio_*_token_id`, `im_start`/`im_end`, `pad_token_id`, `audio_tokenizer_*`, `local_transformer_layers`, … |
-| `tokenizer.model` | SentencePiece — bắt buộc để tokenize text giống Python (`MossTTSNanoSentencePieceTokenizer`). |
-| `tokenizer_config.json`, `special_tokens_map.json` | Metadata tokenizer / special tokens. |
-| `prompting.py` | Ghép prompt: `build_prompt_token_ids`, prefix user/assistant, template `<user_inst>`… |
-| `modeling_moss_tts_nano.py` | Forward + **`generate` / `_iter_generation_events`**: luồng global→local→sample→append row. |
-| `gpt2_decoder.py` | Kiến trúc block GPT-2 (RoPE, attn, MLP) dùng cho `transformer` và `local_transformer`. |
-| `configuration_moss_tts_nano.py` | Class config Python (đồng bộ với `config.json`). |
-| `pytorch_model.safetensors` (hoặc `.bin`) | **Phải có** trong `weight/` cùng `config.json` — toàn bộ trọng số TTS (BF16 trên Hub). |
+| Khối | Đường dẫn | File chính | Vai trò |
+|------|-----------|------------|---------|
+| **LLM (TTS causal)** | `checkpoint/` hoặc gốc `model-dir` | `config.json`, `tokenizer.model`, `pytorch_model.safetensors` | Nhận joint grid `[T, 1+n_vq]`, sinh token text (assistant/end) + 16 RVQ/frame. |
+| **Audio tokenizer / codec** | `audio_tokenizer/` | `config.json`, `model-00001-of-00001.safetensors` | Encode WAV→codes (prompt), decode codes→PCM (sau infer). |
 
-**Lưu ý:** Audio codec **không** nằm trong file trên; `config.json` trỏ tới  
-`audio_tokenizer_pretrained_name_or_path`: **MOSS-Audio-Tokenizer-Nano** (tải riêng / ONNX riêng) để `codes → waveform` (sample rate 48000 theo config).
+Cả hai được **mmap** qua reader safetensors tối thiểu (`safetensors.c`), không deserialize PyTorch.
 
 ---
 
-## 2. Spec model cần khóa (từ `config.json`)
+## 2. Source map (C/C++)
 
-- **Global transformer** (`transformer.*`): GPT-2 style, `n_layer=12`, `n_head=12`, `n_embd=768`, `n_inner=3072`, `activation_function=gelu_new`, `position_embedding_type=rope`, `rope_base=10000`, `vocab_size=16384`.
-- **Hàng joint** `input_ids`: shape `[B, T, n_vq + 1]` với `n_vq = 16` → **17 cột**; cột 0 = text; 16 cột sau = audio code hoặc pad **`audio_pad_token_id = 1024`**.
-- **Local transformer** (`local_transformer.*`): `local_transformer_layers = 1`; context theo chiều dài local = `1 + n_vq` bước embed trong một vòng decode frame (xem `_iter_generation_events` trong `modeling_moss_tts_nano.py`).
-- **Token điều khiển generate** (ví dụ): `audio_assistant_slot_token_id`, `audio_end_token_id`, `im_start_token_id`, `im_end_token_id`, `pad_token_id` — đọc đúng số trong `config.json`, không hard-code sai.
+| Module | File | Chức năng |
+|--------|------|-----------|
+| Config | `moss_config.c` | Parse `gpt2_config` + id token audio/text từ JSON. |
+| LLM weights | `moss_weights.c` | Gắn pointer BF16 vào các tensor `transformer.*`, `local_transformer.*`, `audio_embeddings.*`, `audio_lm_heads.*`, `text_lm_head`, v.v. |
+| **GPT forward** | **`moss_gpt2.c`** | Một stack: LN1 → `c_attn` (QKV fused) → **RoPE** → attention nhân quả → `c_proj` → residual → LN2 → MLP (GELU) → residual → `ln_f`. |
+| **Kernel** | **`moss_kernel.c`** | BF16→F32, **GEMV** (`moss_gemv_bf16_nt*`) — có nhánh **`cblas_sdot`** / mở rộng khi có CBLAS; LayerNorm, GELU, softmax hàng, RoPE. |
+| **Audio codec** | **`moss_audio_tok.c`** | QuantizerResidual (weight-norm mats), encoder/decoder **transformer modules** trong f32 (`transformer_module_tm`: LN, QKV linear, causal window attention + RoPE, FFN…), reshape patch; chỗ dense dùng **SGEMM** (`moss_at_batch_mm_nt`) nếu `MOSS_USE_CBLAS`. |
+| Prompt / joint | `moss_sp_prompt.cc`, `moss_tts.c` | SentencePiece + template hoặc **voice_clone** sections; dựng `joint`, vòng sinh frame (global → local → sample). |
+| CLI | `main.c` | `moss_tts_load`, `moss_tts_generate_codes`, `moss_audio_tok_decode_codes`, ghi WAV. |
 
----
-
-## 3. Map tensor Safetensors → runtime C
-
-Weights đặt tên theo PyTorch state dict (đã audit trong `moss_weight_audit.json` ở `cpp/`):
-
-- `transformer.wte.weight` — `[vocab_size, n_embd]`
-- `transformer.h.{i}.*` — attn `c_attn` / `c_proj`, `ln_1` / `ln_2`, mlp `fc_in` / `fc_out`
-- `transformer.ln_f.weight` / `transformer.ln_f.bias`
-- `text_lm_head.weight` — tied với `wte` trong PyTorch; file safetensors có thể là bản copy (OK).
-- `audio_embeddings.{k}.weight`, `audio_lm_heads.{k}.weight` — mỗi kênh `k ∈ [0,15]`, codebook 1024.
-- `local_transformer.h.0.*`, `local_transformer.ln_f.*`
-
-**SIMD:** tập trung vào các op lặp nhiều — matvec/GEMM (QKV, proj, MLP), RoPE, softmax attention, GELU. Chuẩn bị **multi-backend**: `generic` (scalar), **NEON** (ARM64), **AVX2+FMA** (x64), runtime chọn theo CPU (giống hướng `qwen3-tts`).
+SentencePiece **C++**: `moss_sp_prompt.cc` (+ link `-lsentencepiece`).
 
 ---
 
-## 4. Luồng infer đúng (phải khớp Python)
+## 3. Luồng inference (đồng bộ ý `modeling_moss_tts_nano._iter_generation_events`)
 
-Tham chiếu trực tiếp `MossTTSNanoForCausalLM._iter_generation_events`:
+1. **Load**  
+   - `moss_config_load(model_dir)`  
+   - `moss_weights_load` → mmap `checkpoint/pytorch_model.safetensors` (fallback đường dẫn trong code).  
+   - `moss_audio_tok_load` → mmap `audio_tokenizer/*.safetensors`.
 
-1. **Tokenize** text user + **build prompt** (`build_prompt_token_ids` trong `prompting.py`) → chuỗi token text.
-2. **Ghép tensor** `[1, T, 17]`: các cột audio = pad cho đến khi bắt đầu sinh frame.
-3. **Vòng theo frame** (tối đa `max_new_frames`):
-   - `_build_inputs_embeds` → forward **global** `transformer` với **KV cache** (chỉ feed thêm hàng mới mỗi bước nếu `use_kv_cache`).
-   - Lấy hidden **bước thời gian cuối** → đưa vào **local** (chuỗi embed dài dần trong frame).
-   - Sample **một** token text assistant (`text_lm_head`); kiểm tra continue vs `audio_end_token_id` / slot.
-   - Lần lượt **16** bước: mỗi bước sample token audio kênh `k` từ `audio_lm_heads[k]`, nhét embed kênh `k` vào local cho bước sau (repetition penalty / top-k / top-p giống Python nếu cần parity).
-   - Ghép **hàng mới** `[1, 1, 17]`, append vào `input_ids`, cập nhật `attention_mask`.
-4. **Dừng** khi hết continue hoặc đủ frame.
-5. **Codec:** tensor `[B, F, 16]` → waveform (module riêng, weights MOSS-Audio-Tokenizer-Nano).
+2. **Chuẩn bị joint**  
+   - Không có reference audio: `moss_build_prompt_token_ids` + hàng `audio_start` (+ pad các cột VQ).  
+   - Voice clone: `moss_build_voice_clone_sections` + hàng prompt audio (`audio_user_slot` + codes từ `moss_audio_tok_encode_wav_file`).  
 
----
+3. **Vòng sinh frame** (`moss_tts_generate_codes`)  
+   - **Global:** `moss_build_input_embeds` (text WTE / audio_emb theo slot) → `moss_gpt2_forward(&wb.global, …)`.  
+   - **Local:** Hidden bước cuối toàn cục → chèn WTE của token text đã sample → lặp `n_vq` lần: `moss_gpt2_forward(&wb.local, …)` → logits `audio_head[k]` → sampling (temperature / top-k / top-p / repetition penalty như HF).  
+   - Text điều khiển: **assistant slot vs audio_end** (head `text_lm_head` hai lớp ứng viên hoặc greedy).  
+   - Append một hàng joint mới `[assistant_slot | 16 code]`, `S++`.  
 
-## 5. Lộ trình triển khai (theo phase)
+4. **Dừng**  
+   Theo `audio_end` (tuỳ `min_frames`, `fill_to_max`) hoặc `max_new_frames`.
 
-### Phase 0 — Chuẩn parity
+5. **Decode âm thanh**  
+   - `moss_audio_tok_decode_codes` đọc `quantizer.*` + chuỗi `decoder.*`/`encoder.*` trong weight codec → PCM float stereo interleaved → `moss_write_wav16`.
 
-- Script Python nhỏ: cùng `weight/`, cố định `seed`, dump ra file:
-  - `input_ids` sau prompt (shape, dtype int32),
-  - sau frame 0: logits / token text / 16 token audio,
-  - (tuỳ chọn) hidden trung gian.
-- Test C: so khớp từng phase với golden (float tolerance cho BF16).
-
-### Phase 1 — Loader + config
-
-- Đọc `config.json` (JSON tối thiểu hoặc thư viện nhẹ) → struct `moss_model_spec_t`.
-- mmap `pytorch_model.safetensors` (đã có `safetensors.c` trong `cpp/`).
-
-### Phase 2 — Tokenizer
-
-- Link **SentencePiece** C++ (`#include <sentencepiece_processor.h>`) hoặc port tối thiểu: load `tokenizer.model`, `Encode` giống `encode_text` trong `prompting.py`.
-
-### Phase 3 — Prompt builder
-
-- Port logic `build_prompt_prefix` / `build_prompt_suffix` / `build_prompt_token_ids` từ `prompting.py` + ID từ `config.json`.
-
-### Phase 4 — Global transformer
-
-- 12 layer: LN → QKV (fused `c_attn`) → RoPE → softmax attn → `c_proj` → residual → LN → MLP `fc_in` → GELU → `fc_out` → residual.
-- KV cache: lưu K/V theo layout HF, append theo độ dài chuỗi.
-- **SIMD:** kernel matvec BF16→F32 + AVX2/NEON cho phần nóng.
-
-### Phase 5 — Local transformer + heads + sampling
-
-- 1 layer, forward lặp theo độ dài local trong mỗi frame (theo code Python).
-- `text_lm_head` + `audio_lm_heads[k]`; greedy trước, sau đó top-k/top-p/rep penalty như `_sample_next_token`.
-
-### Phase 6 — Codec + CLI
-
-- WAV 48 kHz: tích hợp decoder MOSS-Audio-Tokenizer-Nano (ONNX Runtime C, hoặc subprocess tạm thời).
-- CLI `moss_tts`: `--model-dir ../weight`, `--text`, `--out` / `--output`, `--backend`, `--frames`, tham số sample.
-
-### Phase 7 — Tối ưu & bench
-
-- So sánh `generic` vs SIMD (sai số chấp nhận được).
-- `bench.sh`: RTF / frame/s.
+**KV cache:** bản C hiện **forward lại global với chiều dài đầy đủ `S`** mỗi frame (đúng toán học causal, chi phí \(O(S^2)\) mỗi bước); đây là trade-off đơn giản, không đổi weight.
 
 ---
 
-## 6. Trạng thái code hiện tại trong `cpp/`
+## 4. BLAS dùng ở đâu — “chỉ hỗ trợ nhân ma trận”
 
-- `moss_tts.c` hiện tại là **stub**: không chạy full `transformer` / `local_transformer`, không tokenizer/prompt đúng, codec là sóng giả — **không thể** trùng output PyTorch cho tới khi xong Phase 2–6.
+| Vị trí | Không có CBLAS | Có `MOSS_USE_CBLAS` |
+|--------|----------------|---------------------|
+| `moss_kernel.c` GEMV BF16→F32 | Vòng `for` thuần | `cblas_sdot` trên hàng đã promote F32 |
+| `moss_audio_tok.c` linear theo batch thời gian | Fallback matvec tay | **`cblas_sgemm`** (RowMajor NT) trong `moss_at_batch_mm_nt` |
 
----
-
-## 7. Rủi ro & giảm thiểu
-
-| Rủi ro | Cách xử lý |
-|--------|------------|
-| Sai tên / layout tensor | Dùng `moss_weight_audit.json`, assert shape khi load. |
-| BF16 vs F32 | Chuẩn hoá nội bộ F32 activations, weight BF16 từ mmap. |
-| FlashAttention trong config | Implement **eager** / math attention tương đương (sdpa thường). |
-| Codec ngoài repo | Tách interface `moss_codec_decode`; phase 1 chỉ xuất `.codes` raw. |
+Attention (softmax trên cửa sổ, tích có trọng số V), RoPE, GELU layer-norm trong stack GPT và trong audio tokenizer — **đều tự viết**, không có “attention BLAS”.
 
 ---
 
-## 8. Lệnh build / chạy tham chiếu
+## 5. Chuẩn hóa văn bản vs `infer.py`
+
+`infer.py` chạy `prepare_tts_request_texts` + WeText; C++ chỉ có SentencePiece trên **`--text`**. Để trùng chuỗi token như infer: dùng `tools/prepare_infer_text_for_cpp.py` và **`--text-file`** (đã hỗ trợ trong `main.c`).
+
+---
+
+## 6. Biên dịch & chạy tham khảo (WSL / Linux)
 
 ```bash
-cd /media/hdd1/duongpv/VibeVoice/MOSS-TTS-Nano/cpp
-make
-./moss_tts --model-dir ../weight --text "..." --out out.wav --backend auto
+cd /path/to/mos_tts
+make clean && make -j4   # Makefile: có thể kèm -DMOSS_USE_CBLAS -lopenblas
+
+./moss_tts \
+  --model-dir weight \
+  --text-file normalized.txt \
+  --out out.wav \
+  --frames 128 \
+  --do-sample 1 \
+  --seed 0
 ```
 
-Sau khi implement đúng pipeline: đổi `../weight` trỏ tới bất kỳ bản snapshot nào có đủ `config.json` + `tokenizer.model` + `pytorch_model.safetensors`.
+Điều kiện runtime: **`weight/audio_tokenizer/`** và **`weight/checkpoint/pytorch_model.safetensors`** đầy đủ (main có thể bắt buộc audio tokenizer mmap OK trước khi infer).
 
 ---
 
-*Tài liệu được sinh để đồng bộ với nội dung folder `weight/` tại thời điểm viết; khi config hoặc tên tensor trên Hub thay đổi, cần cập nhật Phase 1 và bảng map tensor.*
+## 7. Hướng mở rộng / parity
+
+- KV cache incremental cho global (giảm độ phức tạp độ dài joint).  
+- SIMD riêng (NEON/AVX) cho GEMV BF16 và attention (theo kiểu `qwen3-tts`).  
+- So golden: dump logits/codes một bước so với Python (`tools/*.py`).  
+- Nếu Hub đổi tên shard audio (`model-xxxx-of-yyyy`): cập nhật `moss_audio_tok_load`.
+
+---
+
+*Tài liệu phản ánh layout hiện tại trong repo workspace; không dựa Torch cho forward; BLAS chỉ là tầng nhân.*

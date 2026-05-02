@@ -21,6 +21,17 @@ static void bf16_row_to_f32(float *dst, const uint16_t *src, int n) {
     for (int i = 0; i < n; i++) dst[i] = moss_bf16_to_f32(src[i]);
 }
 
+static int moss_use_pure_gemv(void) {
+    static int initialized = 0;
+    static int use_pure = 0;
+    if (!initialized) {
+        const char *v = getenv("MOSS_FORCE_PURE_GEMV");
+        use_pure = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+        initialized = 1;
+    }
+    return use_pure;
+}
+
 void moss_layernorm_bf16(
     float *out,
     const float *x,
@@ -47,6 +58,15 @@ void moss_layernorm_bf16(
 }
 
 void moss_gemv_bf16_nt(float *y, const uint16_t *W, const float *x, int rows, int cols) {
+    if (moss_use_pure_gemv()) {
+        for (int r = 0; r < rows; r++) {
+            const uint16_t *wr = W + (size_t)r * cols;
+            float s = 0.0f;
+            for (int c = 0; c < cols; c++) s += moss_bf16_to_f32(wr[c]) * x[c];
+            y[r] += s;
+        }
+        return;
+    }
 #ifdef MOSS_USE_CBLAS
     float *tmp = (float *)malloc((size_t)cols * sizeof(float));
     if (!tmp) {
@@ -75,6 +95,15 @@ void moss_gemv_bf16_nt(float *y, const uint16_t *W, const float *x, int rows, in
 }
 
 void moss_gemv_bf16_nt_bias(float *y, const uint16_t *W, const uint16_t *b_bf16, const float *x, int rows, int cols) {
+    if (moss_use_pure_gemv()) {
+        for (int r = 0; r < rows; r++) {
+            const uint16_t *wr = W + (size_t)r * cols;
+            float s = moss_bf16_to_f32(b_bf16[r]);
+            for (int c = 0; c < cols; c++) s += moss_bf16_to_f32(wr[c]) * x[c];
+            y[r] = s;
+        }
+        return;
+    }
 #ifdef MOSS_USE_CBLAS
     float *tmp = (float *)malloc((size_t)cols * sizeof(float));
     if (!tmp) {

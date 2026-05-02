@@ -40,6 +40,10 @@ static int fill_layer(moss_gpt2_layer_w_t *L, safetensors_file_t *sf, const char
 
 int moss_weights_load(const char *model_dir, moss_weight_bundle_t *out, const moss_run_config_t *cfg) {
     memset(out, 0, sizeof(*out));
+    if (!cfg || cfg->n_vq < 1 || cfg->n_vq > MOSS_MAX_NVQ) {
+        fprintf(stderr, "moss_weights_load: invalid n_vq=%d (expected 1..%d)\n", cfg ? cfg->n_vq : -1, MOSS_MAX_NVQ);
+        return -1;
+    }
     char path[1024];
     snprintf(path, sizeof(path), "%s/pytorch_model.safetensors", model_dir);
     out->sf = safetensors_open(path);

@@ -20,6 +20,8 @@ typedef struct {
 /* Load audio tokenizer config + safetensors shard from model_dir/audio_tokenizer. */
 int moss_audio_tok_load(const char *model_dir, moss_audio_tok_t *out);
 void moss_audio_tok_unload(moss_audio_tok_t *tok);
+/* Nonzero if tokenizer weights are mmap'd (needed for WAV decode / native prompt encode). */
+int moss_audio_tok_is_loaded(const moss_audio_tok_t *tok);
 
 /* Phase-2 target (native WAV->codes). Placeholder for now. */
 int moss_audio_tok_encode_wav(
@@ -31,7 +33,7 @@ int moss_audio_tok_encode_wav(
     int *out_frames
 );
 
-/* Convenience API: read WAV file then encode to [frames * num_quantizers] int codes. */
+/* Read audio file → VQ codes. True RIFF/WAVE PCM handled natively; other containers (FLAC misnamed .wav, MP4, MP3…) need ffmpeg unless MOSS_DISABLE_FFMPEG is set. MOSS_FFMPEG overrides ffmpeg binary path. */
 int moss_audio_tok_encode_wav_file(
     const moss_audio_tok_t *tok,
     const char *wav_path,

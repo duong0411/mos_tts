@@ -15,7 +15,7 @@ extern "C" {
 #define MOSS_MAX_FRAMES 512
 #define MOSS_MAX_JOINT_ROWS 1024
 #define MOSS_MAX_PROMPT_AUDIO_FRAMES 1024
-#define MOSS_N_COLS 17
+#define MOSS_N_COLS (1 + MOSS_MAX_NVQ)
 
 typedef enum {
     MOSS_BACKEND_AUTO = 0,
@@ -35,15 +35,22 @@ typedef struct {
 typedef struct {
     int max_new_frames;
     int min_frames;
+    int fill_to_max; /* 1: ignore audio_end until max_new_frames (forces ~--frames new audio frames) */
     int sample_rate;
     float temperature; /* legacy; also used as default for text_temperature if unset elsewhere */
     int do_sample;       /* 1 = match infer.py default: sample assistant vs end (2-way only) */
     float text_temperature;
+    float text_top_p; /* infer.py resolve_sampling_kwargs: default 1.0); HF _sample_next_assistant_text_token */
+    int text_top_k; /* default 50; only values 1 or >=2 affect the 2-way head */
     float audio_temperature;
     float audio_top_p;
     int audio_top_k;
     float audio_repetition_penalty;
     unsigned long long rng_seed; /* 0 = seed from time (non-deterministic) */
+    /* infer.py voice_clone: chunk target token budget; <= 0 disables (single joint, full text). Default 75. */
+    int voice_clone_max_text_tokens;
+    /* After each moss_tts_generate_codes: updated PRNG state (xoroshiro); 0 on entry = init from rng_seed/time. */
+    unsigned long long rng_state;
 } moss_generate_params_t;
 
 moss_tts_ctx_t *moss_tts_load(const char *model_dir, moss_backend_t backend);
@@ -59,7 +66,7 @@ int moss_tts_generate_codes(
     moss_tts_ctx_t *ctx,
     const char *text,
     const char *prompt_audio_codes_path,
-    const moss_generate_params_t *params,
+    moss_generate_params_t *params,
     int *out_codes,
     int *out_frames
 );
