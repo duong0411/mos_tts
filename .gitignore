@@ -9,3 +9,12 @@ weight/
 moss_tts
 moss_tts.exe
 NUL
+tools/
+
+# python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+scripts/
+
