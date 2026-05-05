@@ -16,7 +16,7 @@
 /* ========================================================================
  * Minimal JSON parser for safetensors header
  * ======================================================================== */
-
+//reject whitespace
 static void skip_whitespace(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
 }

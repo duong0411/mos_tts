@@ -2,11 +2,10 @@
 #include "moss_sp_prompt.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <errno.h>
 
 #ifndef _WIN32
 static int moss_is_windows_drive_path(const char *p) {
@@ -61,8 +60,8 @@ static void usage(const char *argv0) {
         "Options:\n"
         "  --prompt-audio-path PATH  Reference audio (PCM RIFF/WAVE or any format ffmpeg can read; see MOSS_FFMPEG)\n"
         "  --prompt-audio-codes FILE  Precomputed VQ text file (line1=T, then T lines of 16 ints)\n"
-        "  --max-new-frames N  Maximum generated frames per chunk (default: 375, same as infer.py)\n"
-        "  --frames N        Alias for --max-new-frames (upper cap; model may stop sooner on end token)\n"
+        "  --max-new-frames N  Maximum generated frames per chunk (default: %d, same as infer.py)\n"
+        "  --frames N        Alias for --max-new-frames (upper cap; model may stop sooner on audio_end)\n"
         "  --min-frames N    Ignore end token until N frames (default: 0; infer.py has no minimum)\n"
         "  --fill-to-max     Ignore end until --frames is reached (steady length for long text)\n"
         "                     (aliases: --fill-to_max --fill_to_max)\n"
@@ -73,15 +72,26 @@ static void usage(const char *argv0) {
         "  --text-top-p F    Text nucleus top-p for assistant-vs-end step (default: 1.0)\n"
         "  --text-top-k N    Text top-k for that step (default: 50; only 1 vs 2 matter for 2-way head)\n"
         "  --text STRING     Raw UTF-8 (infer.py also normalizes text unless you match it via --text-file)\n"
-        "  --text-file PATH  UTF-8 file (recommended: tools/prepare_infer_text_for_cpp.py > file.txt)\n"
+        "  --text-file PATH  UTF-8 text file path only (not inline Chinese; use --text for that)\n"
+        "                     (recommended: tools/prepare_infer_text_for_cpp.py > file.txt)\n"
         "  --audio-temperature F  Audio token sampling temperature (default: 0.8)\n"
         "  --audio-top-p F   Audio nucleus sampling top-p in (0,1] (default: 0.95)\n"
         "  --audio-top-k N   Audio top-k sampling (default: 25)\n"
         "  --audio-repetition-penalty F  Audio repetition penalty >= 1.0 (default: 1.2)\n"
+        "  --end-token-logit-bias F  Additive bias on audio_end logit (default: 0.0; >0 stops earlier)\n"
         "  --voice-clone-max-text-tokens N  Pocket-tts chunking like infer.py (default: 75; <=0 disables)\n"
         "  --dump-codes FILE  Dump generated audio token ids (line1=frames, then 16 ints per line)\n"
-        "  --seed U          RNG seed (unsigned); default: nondeterministic\n",
-        argv0);
+        "  --seed U          RNG seed (unsigned); 0 = auto (time-based). Omit flag for same auto behavior.\n"
+        "Environment:\n"
+        "  MOSS_VERBOSE_FRAMES=1  Log every AR frame (default: first + every 25th; less stderr I/O)\n"
+        "  MOSS_DEBUG_LAYER_STATS=1  Per-GPT2-forward: last token row stats after each block + final ln_f\n"
+        "  MOSS_DEBUG_LAYER_STATS_VERBOSE=1  Also ln1, attn pre-proj, ln2, MLP gelu, MLP out (same row)\n"
+        "  MOSS_DEBUG_LAYER_CALLS=N  Only first N moss_gpt2_forward invocations (default 1; raise to trace more)\n"
+        "  MOSS_DEBUG_BLOCK0_COMPONENTS=1  Extra substages for stack call 1 layer 0 only\n"
+        "  MOSS_DEBUG_ATTN_LAYER0=1  Pre-softmax attn stats layer0 head0 last query row (call 1)\n"
+        "  MOSS_DEBUG_FIRST_STEP=1  Frame-0 logits/hidden stats in moss_tts (match cpp/tools log_python_*.py)\n",
+        argv0,
+        MOSS_DEFAULT_MAX_NEW_FRAMES);
 }
 
 static int moss_append_float_pcm(float **acc, int *acc_n, const float *blk, int blk_n) {
@@ -126,6 +136,11 @@ static char *moss_read_text_payload(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "[moss_tts] cannot open --text-file %s: %s\n", path, strerror(errno));
+        if (errno == ENOENT) {
+            fprintf(stderr,
+                "[moss_tts] hint: --text-file is a path to a UTF-8 file on disk, not the sentence itself. "
+                "Use --text \"…\" for inline UTF-8, or echo -n '…' > tmp.txt && --text-file tmp.txt\n");
+        }
         return NULL;
     }
     if (fseek(f, 0, SEEK_END) != 0) {
@@ -178,7 +193,10 @@ static moss_backend_t parse_backend(const char *s) {
 int main(int argc, char **argv) {
     moss_argv_strip_tail_cr(argc, argv);
 
-    setbuf(stderr, NULL);
+    /* Unbuffered stderr forces a flush per log line and can dominate wall time on long runs. */
+    if (setvbuf(stderr, NULL, _IOLBF, 0) != 0) {
+        setbuf(stderr, NULL);
+    }
     const char *model_dir = NULL;
     const char *text = NULL;
     char *text_file_owned = NULL;
@@ -187,7 +205,7 @@ int main(int argc, char **argv) {
     const char *prompt_audio_input_path = NULL;
     moss_backend_t backend = MOSS_BACKEND_AUTO;
     moss_generate_params_t params = {
-        .max_new_frames = 375,
+        .max_new_frames = MOSS_DEFAULT_MAX_NEW_FRAMES,
         .min_frames = 0,
         .fill_to_max = 0,
         .sample_rate = 48000,
@@ -200,6 +218,7 @@ int main(int argc, char **argv) {
         .audio_top_p = 0.95f,
         .audio_top_k = 25,
         .audio_repetition_penalty = 1.2f,
+        .end_token_logit_bias = 0.0f,
         .rng_seed = 0,
         .voice_clone_max_text_tokens = 75,
         .rng_state = 0,
@@ -244,6 +263,8 @@ int main(int argc, char **argv) {
             params.audio_top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--audio-repetition-penalty") == 0 && i + 1 < argc)
             params.audio_repetition_penalty = (float)strtod(argv[++i], NULL);
+        else if (strcmp(argv[i], "--end-token-logit-bias") == 0 && i + 1 < argc)
+            params.end_token_logit_bias = (float)strtod(argv[++i], NULL);
         else if (strcmp(argv[i], "--voice-clone-max-text-tokens") == 0 && i + 1 < argc)
             params.voice_clone_max_text_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--dump-codes") == 0 && i + 1 < argc)
@@ -358,7 +379,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
         "[moss_tts] generating (max_new_frames=%d, min_frames=%d, fill_to_max=%d) do_sample=%d "
-        "text_temperature=%g text_top_p=%g text_top_k=%d audio_temp=%g top_p=%g top_k=%d rep_pen=%g seed=%llu ...\n",
+        "text_temperature=%g text_top_p=%g text_top_k=%d end_bias=%g audio_temp=%g top_p=%g top_k=%d rep_pen=%g ",
         params.max_new_frames,
         params.min_frames,
         params.fill_to_max,
@@ -366,11 +387,15 @@ int main(int argc, char **argv) {
         (double)params.text_temperature,
         (double)params.text_top_p,
         params.text_top_k,
+        (double)params.end_token_logit_bias,
         (double)params.audio_temperature,
         (double)params.audio_top_p,
         params.audio_top_k,
-        (double)params.audio_repetition_penalty,
-        (unsigned long long)params.rng_seed);
+        (double)params.audio_repetition_penalty);
+    if (params.rng_seed != 0ull)
+        fprintf(stderr, "seed=%llu ...\n", (unsigned long long)params.rng_seed);
+    else
+        fprintf(stderr, "seed=auto(time) ...\n");
 
     float *samples = NULL;
     int n_samples = 0;
@@ -514,7 +539,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "[moss_tts] writing %s ...\n", out);
     if (moss_write_wav16(out, samples, n_samples, params.sample_rate, n_channels) != 0) {
-        fprintf(stderr, "Failed to write wav: %s\n", out);
+        fprintf(stderr, "Failed to write wav: %s (%s)\n", out, strerror(errno));
         free(samples);
         free(codes);
         moss_tts_unload(ctx);

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #ifdef __x86_64__
 #include <cpuid.h>
@@ -353,6 +354,7 @@ static int moss_text_assistant_or_end_pick_bf16(
     float text_temperature,
     int text_top_k,
     float text_top_p,
+    float end_token_logit_bias,
     uint64_t *rng,
     float *out_assistant_logit,
     float *out_end_logit
@@ -365,6 +367,8 @@ static int moss_text_assistant_or_end_pick_bf16(
         s_ass += moss_bf16_to_f32(wa[i]) * xi;
         s_end += moss_bf16_to_f32(we[i]) * xi;
     }
+    /* Optional runtime knob to encourage earlier stopping without changing model weights. */
+    s_end += end_token_logit_bias;
     if (out_assistant_logit) *out_assistant_logit = s_ass;
     if (out_end_logit) *out_end_logit = s_end;
     if (!do_sample) return (s_ass >= s_end) ? assistant_id : end_id;
@@ -485,7 +489,7 @@ static void moss_debug_dump_int_row(const char *tag, int row_idx, const int *row
     fprintf(stderr, "\n");
 }
 
-/* Read WAV and encode to VQ using native C path; Python fallback kept temporarily. */
+/* WAV -> VQ: native moss_audio_tok only (no Python encoder). */
 static int read_prompt_audio_codes_from_wav(
     const moss_audio_tok_t *tok,
     const char *model_dir,
@@ -494,68 +498,37 @@ static int read_prompt_audio_codes_from_wav(
     int *out_flat,
     int *out_T
 ) {
-    int *native_codes = NULL;
-    int native_T = 0;
-    if (tok && tok->sf) {
-        fprintf(stderr, "[moss_tts] prompt-audio-path detected: %s\n", wav_path);
-        fprintf(stderr, "[moss_tts] encoding WAV -> VQ using native C/C++ audio tokenizer\n");
+    if (!tok || !tok->sf) {
+        fprintf(stderr,
+            "[moss_tts] --prompt-audio-path needs a loaded native audio tokenizer under %s/audio_tokenizer\n",
+            model_dir && model_dir[0] ? model_dir : "(model-dir)");
         fflush(stderr);
-        if (moss_audio_tok_encode_wav_file(tok, wav_path, &native_codes, &native_T) == 0 && native_codes && native_T >= 0) {
-            if (native_T > MOSS_MAX_PROMPT_AUDIO_FRAMES) native_T = MOSS_MAX_PROMPT_AUDIO_FRAMES;
-            for (int t = 0; t < native_T; t++) {
-                for (int j = 0; j < nvq; j++) {
-                    out_flat[t * nvq + j] = native_codes[t * nvq + j];
-                }
-            }
-            free(native_codes);
-            *out_T = native_T;
-            return 0;
-        }
-        free(native_codes);
-        fprintf(stderr, "[moss_tts] native prompt-audio encoder failed or needs ffmpeg — trying Python fallback\n");
-        fflush(stderr);
-    }
-
-    char script[2048];
-    char cmd[8192];
-    const char *py = getenv("MOSS_PYTHON");
-    if (!py || !py[0]) py = "python3";
-
-    if (snprintf(script, sizeof(script), "%s/../cpp/moss_encode_prompt_wav.py", model_dir) >= (int)sizeof(script)) {
-        return -1;
-    }
-    if (snprintf(
-            cmd,
-            sizeof(cmd),
-            "TRANSFORMERS_NO_TORCHVISION=1 TORCHVISION_DISABLE_NMS_OP=1 %s \"%s\" \"%s\" \"%s\"",
-            py,
-            script,
-            model_dir,
-            wav_path
-        ) >= (int)sizeof(cmd)) {
         return -1;
     }
 
-    fprintf(stderr, "[moss_tts] encoding WAV -> VQ using %s (set MOSS_PYTHON to override)\n", py);
+    fprintf(stderr, "[moss_tts] prompt-audio-path: %s\n", wav_path);
+    fprintf(stderr, "[moss_tts] encoding WAV -> VQ (native C/C++ only)\n");
     fflush(stderr);
 
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    int T = 0;
-    if (fscanf(p, "%d", &T) != 1 || T < 0 || T > MOSS_MAX_PROMPT_AUDIO_FRAMES) {
-        pclose(p);
+    int *native_codes = NULL;
+    int native_T = 0;
+    if (moss_audio_tok_encode_wav_file(tok, wav_path, &native_codes, &native_T) != 0 || !native_codes || native_T < 0) {
+        free(native_codes);
+        fprintf(stderr,
+            "[moss_tts] native WAV->VQ encode failed (use PCM WAV readable by the decoder, or ffmpeg for other "
+            "formats if built with decode support; check audio_tokenizer weights).\n");
+        fflush(stderr);
         return -1;
     }
-    for (int t = 0; t < T; t++) {
+
+    if (native_T > MOSS_MAX_PROMPT_AUDIO_FRAMES) native_T = MOSS_MAX_PROMPT_AUDIO_FRAMES;
+    for (int t = 0; t < native_T; t++) {
         for (int j = 0; j < nvq; j++) {
-            if (fscanf(p, "%d", &out_flat[t * nvq + j]) != 1) {
-                pclose(p);
-                return -1;
-            }
+            out_flat[t * nvq + j] = native_codes[t * nvq + j];
         }
     }
-    if (pclose(p) != 0) return -1;
-    *out_T = T;
+    free(native_codes);
+    *out_T = native_T;
     return 0;
 }
 
@@ -623,7 +596,9 @@ moss_tts_ctx_t *moss_tts_load(const char *model_dir, moss_backend_t backend) {
             ctx->audio_tok.cfg.num_quantizers,
             ctx->audio_tok.cfg.codebook_size);
     } else {
-        fprintf(stderr, "[moss_tts] warning: native audio tokenizer load failed; fallback path may use Python.\n");
+        fprintf(stderr,
+            "[moss_tts] warning: native audio tokenizer load failed; WAV prompt encoding and decode need "
+            "weight/audio_tokenizer (no Python encoder).\n");
     }
     fflush(stderr);
     return ctx;
@@ -661,7 +636,8 @@ int moss_tts_generate_codes(
     const int Dh = D / cfg->n_head;
     const int I = cfg->n_inner;
     const int nvq = cfg->n_vq;
-    const int max_frames = params->max_new_frames > 0 ? params->max_new_frames : MOSS_MAX_FRAMES;
+    const int max_frames =
+        params->max_new_frames > 0 ? params->max_new_frames : MOSS_DEFAULT_MAX_NEW_FRAMES;
     int dbg_input_pipeline = 0;
     {
         const char *dbg = getenv("MOSS_DEBUG_INPUT_PIPELINE");
@@ -817,13 +793,15 @@ int moss_tts_generate_codes(
     float *hidden = (float *)malloc((size_t)MOSS_MAX_JOINT_ROWS * D * sizeof(float));
     unsigned char *mask = (unsigned char *)malloc((size_t)MOSS_MAX_JOINT_ROWS);
     float *loc = (float *)malloc((size_t)local_max_S * D * sizeof(float));
+    float *loc_run = (float *)malloc((size_t)local_max_S * D * sizeof(float));
     unsigned char *mask_loc = (unsigned char *)malloc((size_t)local_max_S);
 
-    if (!scratch || !hidden || !mask || !loc || !mask_loc) {
+    if (!scratch || !hidden || !mask || !loc || !loc_run || !mask_loc) {
         free(scratch);
         free(hidden);
         free(mask);
         free(loc);
+        free(loc_run);
         free(mask_loc);
         free(joint);
         return -6;
@@ -847,26 +825,34 @@ int moss_tts_generate_codes(
     }
 
     int frame = 0;
+    int stopped_by_audio_end = 0;
     int debug_first_step = 0;
     {
         const char *dbg = getenv("MOSS_DEBUG_FIRST_STEP");
         if (dbg && dbg[0] && strcmp(dbg, "0") != 0) debug_first_step = 1;
     }
+    int log_every_ar_frame = 0;
+    {
+        const char *vf = getenv("MOSS_VERBOSE_FRAMES");
+        if (vf && vf[0] && strcmp(vf, "0") != 0) log_every_ar_frame = 1;
+    }
 
     for (; frame < max_frames; frame++) {
         if (S >= MOSS_MAX_JOINT_ROWS) break;
 
-        fprintf(stderr, "[moss_tts] frame %d/%d joint_seq_len=%d (global GPT-2 forward)\n",
-            frame + 1, max_frames, S);
-        fflush(stderr);
+        if (log_every_ar_frame || frame == 0 || ((frame + 1) % 25) == 0) {
+            fprintf(stderr, "[moss_tts] frame %d/%d joint_seq_len=%d (global GPT-2 forward)\n",
+                frame + 1, max_frames, S);
+        }
 
         for (int i = 0; i < S; i++) mask[i] = 1;
         moss_build_input_embeds(w, cfg, joint, S, hidden);
-        if (moss_gpt2_forward(&w->global, cfg, hidden, S, mask, scratch, scratch_elems) != 0) {
+        if (moss_gpt2_forward(&w->global, cfg, hidden, S, mask, scratch, scratch_elems, "global") != 0) {
             free(scratch);
             free(hidden);
             free(mask);
             free(loc);
+            free(loc_run);
             free(mask_loc);
             free(joint);
             return -7;
@@ -876,11 +862,12 @@ int moss_tts_generate_codes(
 
         int S_loc = 1;
         memcpy(loc, h_last, (size_t)D * sizeof(float));
-        if (moss_gpt2_forward(&w->local, cfg, loc, S_loc, mask_loc, scratch, scratch_elems) != 0) {
+        if (moss_gpt2_forward(&w->local, cfg, loc, S_loc, mask_loc, scratch, scratch_elems, "local") != 0) {
             free(scratch);
             free(hidden);
             free(mask);
             free(loc);
+            free(loc_run);
             free(mask_loc);
             free(joint);
             return -8;
@@ -922,6 +909,7 @@ int moss_tts_generate_codes(
             text_temp,
             params->text_top_k,
             params->text_top_p,
+            params->end_token_logit_bias,
             &rng,
             (debug_first_step && frame == 0) ? &dbg_ass_logit : NULL,
             (debug_first_step && frame == 0) ? &dbg_end_logit : NULL
@@ -938,6 +926,7 @@ int moss_tts_generate_codes(
                 (double)text_temp);
             fflush(stderr);
         }
+        /* Same stop as modeling_moss_tts_nano._iter_generation_events: end token ends this step with no new RVQ row. */
         if (text_tok == cfg->audio_end_token_id) {
             if (frame < min_frames_eff) {
                 text_tok = cfg->audio_assistant_slot_token_id;
@@ -946,13 +935,14 @@ int moss_tts_generate_codes(
                     frame + 1, min_frames_eff);
                 fflush(stderr);
             } else {
-            fprintf(stderr,
-                "[moss_tts] stop: text head chose audio_end_token_id=%d (frame %d, do_sample=%d)\n",
-                cfg->audio_end_token_id,
-                frame + 1,
-                params->do_sample != 0);
-            fflush(stderr);
-            break;
+                fprintf(stderr,
+                    "[moss_tts] stop: text head chose audio_end_token_id=%d (1-based step %d, do_sample=%d)\n",
+                    cfg->audio_end_token_id,
+                    frame + 1,
+                    params->do_sample != 0);
+                fflush(stderr);
+                stopped_by_audio_end = 1;
+                break;
             }
         }
 
@@ -961,11 +951,15 @@ int moss_tts_generate_codes(
         S_loc = 2;
 
         for (int ch = 0; ch < cfg->n_vq; ch++) {
-            if (moss_gpt2_forward(&w->local, cfg, loc, S_loc, mask_loc, scratch, scratch_elems) != 0) {
+            /* Keep local input embeddings immutable across channels, matching Python local_inputs_embeds behavior.
+             * moss_gpt2_forward mutates `hidden` in-place, so run on a working copy. */
+            memcpy(loc_run, loc, (size_t)S_loc * (size_t)D * sizeof(float));
+            if (moss_gpt2_forward(&w->local, cfg, loc_run, S_loc, mask_loc, scratch, scratch_elems, "local") != 0) {
                 free(scratch);
                 free(hidden);
                 free(mask);
                 free(loc);
+                free(loc_run);
                 free(mask_loc);
                 free(joint);
                 return -9;
@@ -979,7 +973,7 @@ int moss_tts_generate_codes(
             }
             int a_tok = moss_sample_audio_token_bf16(
                 w->audio_head[ch],
-                loc + (size_t)(S_loc - 1) * D,
+                loc_run + (size_t)(S_loc - 1) * D,
                 cfg->audio_vocab_size,
                 D,
                 params->do_sample != 0,
@@ -997,7 +991,7 @@ int moss_tts_generate_codes(
                 moss_debug_log_topk_bf16(
                     "frame=0 audio_head_ch0_top5",
                     w->audio_head[ch],
-                    loc + (size_t)(S_loc - 1) * D,
+                    loc_run + (size_t)(S_loc - 1) * D,
                     cfg->audio_vocab_size,
                     D,
                     5
@@ -1005,7 +999,7 @@ int moss_tts_generate_codes(
                 moss_debug_log_selected_logits_bf16(
                     "frame=0 audio_head_ch0_selected",
                     w->audio_head[ch],
-                    loc + (size_t)(S_loc - 1) * D,
+                    loc_run + (size_t)(S_loc - 1) * D,
                     cfg->audio_vocab_size,
                     D,
                     audio_dbg_ids,
@@ -1025,13 +1019,20 @@ int moss_tts_generate_codes(
 
     *out_frames = frame;
     params->rng_state = (unsigned long long)rng;
-    fprintf(stderr, "[moss_tts] done: %d audio frame(s)\n", frame);
+    if (stopped_by_audio_end) {
+        fprintf(stderr, "[moss_tts] done: %d audio frame(s), stop_reason=audio_end\n", frame);
+    } else if (frame >= max_frames) {
+        fprintf(stderr, "[moss_tts] done: %d audio frame(s), stop_reason=max_new_frames_cap(%d)\n", frame, max_frames);
+    } else {
+        fprintf(stderr, "[moss_tts] done: %d audio frame(s), stop_reason=loop_exit\n", frame);
+    }
     fflush(stderr);
 
     free(scratch);
     free(hidden);
     free(mask);
     free(loc);
+    free(loc_run);
     free(mask_loc);
     free(joint);
     return 0;
@@ -1071,9 +1072,30 @@ int moss_tts_decode_codes_to_wav(
     return 0;
 }
 
+/* Create parent directories for a file path (mkdir -p style). Ignores if no '/' in path. */
+static int moss_mkdirs_for_file(const char *path) {
+    char buf[4096];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(buf)) return -1;
+    memcpy(buf, path, n + 1u);
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return 0;
+    *slash = '\0';
+    if (buf[0] == '\0') return 0;
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(buf, (mode_t)0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    if (mkdir(buf, (mode_t)0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
 int moss_write_wav16(const char *path, const float *samples, int n_samples, int sample_rate, int n_channels) {
     if (!path || !samples || n_samples <= 0 || sample_rate <= 0 || n_channels <= 0) return -1;
     if (n_samples % n_channels != 0) return -1;
+    if (moss_mkdirs_for_file(path) != 0) return -1;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
 

@@ -43,7 +43,7 @@ endif
 
 LDLIBS = -lm
 
-SRCS = main.c moss_tts.c safetensors.c moss_config.c moss_kernel.c moss_gpt2.c moss_weights.c moss_audio_tok.c
+SRCS = main.c moss_tts.c safetensors.c moss_config.c moss_kernel.c moss_gpt2.c moss_weights.c moss_audio_tok_load.c moss_audio_tok_graph.c moss_audio_tok_encode.c moss_audio_tok_decode.c
 OBJS = $(SRCS:.c=.o) moss_sp_prompt.o
 TARGET = moss_tts
 

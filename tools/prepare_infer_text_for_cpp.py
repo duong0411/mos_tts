@@ -2,8 +2,8 @@
 """
 Normalize text the same way as MOSS-TTS-Nano infer.py before model.inference().
 
-Typical usage (WSL/Linux):
-  python3 tools/prepare_infer_text_for_cpp.py --text "..." > normalized.txt
+Typical usage (from MOSS-TTS-Nano repo root):
+  python3 cpp/tools/prepare_infer_text_for_cpp.py --text "..." > normalized.txt
   ./moss_tts --model-dir weight --text-file normalized.txt --out out.wav ...
 
 This matches prepare_tts_request_texts() + WeText defaults from infer.py.
@@ -15,9 +15,10 @@ import logging
 import sys
 from pathlib import Path
 
-_NANO = Path(__file__).resolve().parent.parent / "MOSS-TTS-Nano"
-if _NANO.is_dir():
-    sys.path.insert(0, str(_NANO))
+# .../MOSS-TTS-Nano/cpp/tools/this.py -> repo root .../MOSS-TTS-Nano (where text_normalization_pipeline.py lives)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if (_REPO_ROOT / "text_normalization_pipeline.py").is_file():
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from text_normalization_pipeline import (  # noqa: E402
     WeTextProcessingManager,

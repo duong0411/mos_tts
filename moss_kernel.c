@@ -246,3 +246,68 @@ void moss_apply_rope_inplace(
         }
     }
 }
+
+void moss_linear_f32(float *y, const float *W, const float *x, int out_dim, int in_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const float *wo = W + (size_t)o * in_dim;
+        float s = 0.0f;
+        for (int i = 0; i < in_dim; i++) s += wo[i] * x[i];
+        y[o] = s;
+    }
+}
+
+void moss_matvec_bias_f32(float *y, const float *W, const float *b, const float *x, int rows, int cols) {
+#ifdef MOSS_USE_CBLAS
+    if (rows > 0 && cols > 0) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, rows, cols, 1.0f, W, cols, x, 1, 0.0f, y, 1);
+        if (b) {
+            for (int r = 0; r < rows; r++) y[r] += b[r];
+        }
+        return;
+    }
+#endif
+    for (int r = 0; r < rows; r++) {
+        const float *wr = W + (size_t)r * cols;
+        float s = b ? b[r] : 0.0f;
+        for (int c = 0; c < cols; c++) s += wr[c] * x[c];
+        y[r] = s;
+    }
+}
+
+void moss_build_weightnorm_matrix_f32(float *W_eff, const float *g, const float *v, int out_dim, int in_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const float *vo = v + (size_t)o * in_dim;
+        float n2 = 0.0f;
+        for (int i = 0; i < in_dim; i++) n2 += vo[i] * vo[i];
+        float scale = g[o] / sqrtf(n2 + 1e-12f);
+        float *wo = W_eff + (size_t)o * in_dim;
+        for (int i = 0; i < in_dim; i++) wo[i] = vo[i] * scale;
+    }
+}
+
+void moss_batch_mm_nt_f32(const float *X, const float *W, float *Y, int T, int out_dim, int in_dim) {
+#ifdef MOSS_USE_CBLAS
+    if (T > 0 && out_dim > 0 && in_dim > 0) {
+        cblas_sgemm(
+            CblasRowMajor,
+            CblasNoTrans,
+            CblasTrans,
+            T,
+            out_dim,
+            in_dim,
+            1.0f,
+            X,
+            in_dim,
+            W,
+            in_dim,
+            0.0f,
+            Y,
+            out_dim
+        );
+        return;
+    }
+#endif
+    for (int t = 0; t < T; t++) {
+        moss_linear_f32(Y + (size_t)t * out_dim, W, X + (size_t)t * in_dim, out_dim, in_dim);
+    }
+}

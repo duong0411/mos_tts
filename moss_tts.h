@@ -13,6 +13,8 @@ extern "C" {
 
 #define MOSS_MAX_TEXT_LEN 4096
 #define MOSS_MAX_FRAMES 512
+/* Upper cap for one generate call; must stay <= MOSS_MAX_FRAMES (buffer sizing in main.c). */
+#define MOSS_DEFAULT_MAX_NEW_FRAMES 375 /* infer.py --max-new-frames default */
 #define MOSS_MAX_JOINT_ROWS 1024
 #define MOSS_MAX_PROMPT_AUDIO_FRAMES 1024
 #define MOSS_N_COLS (1 + MOSS_MAX_NVQ)
@@ -33,6 +35,7 @@ typedef struct {
 } moss_tts_ctx_t;
 
 typedef struct {
+    /* Max audio frames to *attempt*; 0 or negative = use MOSS_DEFAULT_MAX_NEW_FRAMES (same as infer.py). */
     int max_new_frames;
     int min_frames;
     int fill_to_max; /* 1: ignore audio_end until max_new_frames (forces ~--frames new audio frames) */
@@ -46,6 +49,9 @@ typedef struct {
     float audio_top_p;
     int audio_top_k;
     float audio_repetition_penalty;
+    /* Additive bias on audio_end logit in assistant-vs-end text step.
+     * 0.0 keeps baseline behavior; >0 prefers earlier stop; <0 delays stop. */
+    float end_token_logit_bias;
     unsigned long long rng_seed; /* 0 = seed from time (non-deterministic) */
     /* infer.py voice_clone: chunk target token budget; <= 0 disables (single joint, full text). Default 75. */
     int voice_clone_max_text_tokens;
@@ -58,9 +64,8 @@ void moss_tts_unload(moss_tts_ctx_t *ctx);
 const char *moss_backend_name(moss_backend_t backend);
 
 /*
- * prompt_audio_codes_path: optional text file with precomputed VQ rows (same stdout format as old
- * moss_encode_prompt_wav.py: line1 = T, then T lines of n_vq ints). WAV→codes is a separate audio
- * tokenizer (not in TTS safetensors); without ONNX/Python, prepare this file offline.
+ * prompt_audio_codes_path: optional text file with precomputed VQ rows (line1 = T, then T lines of
+ * n_vq ints), or a WAV path encoded by the native audio tokenizer. WAV->VQ uses C/C++ only.
  */
 int moss_tts_generate_codes(
     moss_tts_ctx_t *ctx,

@@ -17,12 +17,20 @@ static void apply_attn_mask_scale_rows(float *hidden, const unsigned char *mask,
     }
 }
 
-static void log_row_stats(const char *tag, int call_idx, int layer_idx, const float *row, int D) {
-    if (!tag || !row || D <= 0) return;
+static void log_row_stats(
+    const char *stack,
+    int call_idx,
+    int layer_idx,
+    const char *tag,
+    const float *row,
+    int dim
+) {
+    if (!tag || !row || dim <= 0) return;
+    const char *sk = (stack && stack[0]) ? stack : "gpt2";
     double sum = 0.0;
     double sq = 0.0;
     float mn = row[0], mx = row[0];
-    for (int i = 0; i < D; i++) {
+    for (int i = 0; i < dim; i++) {
         float v = row[i];
         sum += (double)v;
         sq += (double)v * (double)v;
@@ -30,8 +38,17 @@ static void log_row_stats(const char *tag, int call_idx, int layer_idx, const fl
         if (v > mx) mx = v;
     }
     fprintf(stderr,
-        "[moss_layer] call=%d layer=%d stage=%s sum=%.9g l2=%.9g min=%.9g max=%.9g\n",
-        call_idx, layer_idx, tag, sum, sqrt(sq), (double)mn, (double)mx);
+        "[moss_layer] stack=%s call=%d layer=%d dim=%d stage=%s sum=%.9g l2=%.9g min=%.9g max=%.9g\n",
+        sk,
+        call_idx,
+        layer_idx,
+        dim,
+        tag,
+        sum,
+        sqrt(sq),
+        (double)mn,
+        (double)mx);
+    fflush(stderr);
 }
 
 static void moss_debug_log_attn_scores_pre_softmax(
@@ -91,7 +108,8 @@ int moss_gpt2_forward(
     int S,
     const unsigned char *attn_mask,
     float *scratch,
-    size_t scratch_elems
+    size_t scratch_elems,
+    const char *dbg_stack_id
 ) {
     static int call_counter = 0;
     const int D = cfg->n_embd;
@@ -133,8 +151,10 @@ int moss_gpt2_forward(
     apply_attn_mask_scale_rows(hidden, attn_mask, S, D);
 
     int call_idx = ++call_counter;
+    const char *stack = (dbg_stack_id && dbg_stack_id[0]) ? dbg_stack_id : "gpt2";
     int dbg_enabled = 0;
     int dbg_max_calls = 1;
+    int dbg_verbose = 0;
     {
         const char *e = getenv("MOSS_DEBUG_LAYER_STATS");
         if (e && e[0] && strcmp(e, "0") != 0) dbg_enabled = 1;
@@ -143,6 +163,8 @@ int moss_gpt2_forward(
             int v = atoi(m);
             if (v > 0) dbg_max_calls = v;
         }
+        const char *v = getenv("MOSS_DEBUG_LAYER_STATS_VERBOSE");
+        if (v && v[0] && strcmp(v, "0") != 0) dbg_verbose = 1;
     }
     int dbg_this_call = dbg_enabled && call_idx <= dbg_max_calls;
     int dbg_block0_components = 0;
@@ -162,8 +184,17 @@ int moss_gpt2_forward(
         fflush(stderr);
     }
     if (dbg_this_call) {
-        fprintf(stderr, "[moss_layer] begin call=%d n_layer=%d S=%d D=%d last_row=%d\n", call_idx, nL, S, D, last_row);
-        log_row_stats("input", call_idx, -1, hidden + last_row * D, D);
+        fprintf(stderr,
+            "[moss_layer] stack=%s begin call=%d n_layer=%d S=%d D=%d I=%d last_row=%d\n",
+            stack,
+            call_idx,
+            nL,
+            S,
+            D,
+            I,
+            last_row);
+        fflush(stderr);
+        log_row_stats(stack, call_idx, -1, "input", hidden + last_row * D, D);
     }
 
     for (int li = 0; li < nL; li++) {
@@ -179,7 +210,10 @@ int moss_gpt2_forward(
             );
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_ln1_out", call_idx, li, x_ln + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_ln1_out", x_ln + last_row * D, D);
+        }
+        if (dbg_this_call && dbg_verbose && last_row >= 0) {
+            log_row_stats(stack, call_idx, li, "ln1_out", x_ln + last_row * D, D);
         }
 
         for (int s = 0; s < S; s++) {
@@ -189,17 +223,17 @@ int moss_gpt2_forward(
             memcpy(v + s * D, rowqkv + 2 * D, (size_t)D * sizeof(float));
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_q_pre_rope", call_idx, li, q + last_row * D, D);
-            log_row_stats("comp_k_pre_rope", call_idx, li, k + last_row * D, D);
-            log_row_stats("comp_v", call_idx, li, v + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_q_pre_rope", q + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_k_pre_rope", k + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_v", v + last_row * D, D);
         }
 
         moss_rope_cos_sin(cos, sin, pos_ids, S, Dh, cfg->rope_base);
         moss_apply_rope_inplace(q, cos, sin, S, H, Dh);
         moss_apply_rope_inplace(k, cos, sin, S, H, Dh);
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_q_post_rope", call_idx, li, q + last_row * D, D);
-            log_row_stats("comp_k_post_rope", call_idx, li, k + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_q_post_rope", q + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_k_post_rope", k + last_row * D, D);
         }
 
         const float scale = 1.0f / sqrtf((float)Dh);
@@ -233,7 +267,10 @@ int moss_gpt2_forward(
             }
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_attn_out_pre_proj", call_idx, li, attn_out + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_attn_out_pre_proj", attn_out + last_row * D, D);
+        }
+        if (dbg_this_call && dbg_verbose && last_row >= 0) {
+            log_row_stats(stack, call_idx, li, "attn_out_pre_proj", attn_out + last_row * D, D);
         }
 
         memset(mlp_h, 0, (size_t)S * D * sizeof(float));
@@ -242,11 +279,11 @@ int moss_gpt2_forward(
             moss_vec_add(hidden + s * D, mlp_h + s * D, D);
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_c_proj_out", call_idx, li, mlp_h + last_row * D, D);
-            log_row_stats("comp_post_attn_res", call_idx, li, hidden + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_c_proj_out", mlp_h + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_post_attn_res", hidden + last_row * D, D);
         }
         apply_attn_mask_scale_rows(hidden, attn_mask, S, D);
-        if (dbg_this_call) log_row_stats("post_attn_res", call_idx, li, hidden + last_row * D, D);
+        if (dbg_this_call) log_row_stats(stack, call_idx, li, "post_attn_res", hidden + last_row * D, D);
 
         for (int s = 0; s < S; s++) {
             moss_layernorm_bf16(
@@ -259,7 +296,10 @@ int moss_gpt2_forward(
             );
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_ln2_out", call_idx, li, x_ln + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_ln2_out", x_ln + last_row * D, D);
+        }
+        if (dbg_this_call && dbg_verbose && last_row >= 0) {
+            log_row_stats(stack, call_idx, li, "ln2_out", x_ln + last_row * D, D);
         }
 
         for (int s = 0; s < S; s++) {
@@ -267,7 +307,10 @@ int moss_gpt2_forward(
             moss_gelu_new_inplace(mlp_h + s * I, I);
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_mlp_fc_in_gelu", call_idx, li, mlp_h + last_row * I, I);
+            log_row_stats(stack, call_idx, li, "comp_mlp_fc_in_gelu", mlp_h + last_row * I, I);
+        }
+        if (dbg_this_call && dbg_verbose && last_row >= 0) {
+            log_row_stats(stack, call_idx, li, "mlp_fc_in_gelu", mlp_h + last_row * I, I);
         }
         memset(x_ln, 0, (size_t)S * D * sizeof(float));
         for (int s = 0; s < S; s++) {
@@ -275,11 +318,14 @@ int moss_gpt2_forward(
             moss_vec_add(hidden + s * D, x_ln + s * D, D);
         }
         if (dbg_block0_components && call_idx == 1 && li == 0) {
-            log_row_stats("comp_mlp_fc_out", call_idx, li, x_ln + last_row * D, D);
-            log_row_stats("comp_post_mlp_res", call_idx, li, hidden + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_mlp_fc_out", x_ln + last_row * D, D);
+            log_row_stats(stack, call_idx, li, "comp_post_mlp_res", hidden + last_row * D, D);
+        }
+        if (dbg_this_call && dbg_verbose && last_row >= 0) {
+            log_row_stats(stack, call_idx, li, "mlp_fc_out_pre_add", x_ln + last_row * D, D);
         }
         apply_attn_mask_scale_rows(hidden, attn_mask, S, D);
-        if (dbg_this_call) log_row_stats("post_mlp_res", call_idx, li, hidden + last_row * D, D);
+        if (dbg_this_call) log_row_stats(stack, call_idx, li, "post_mlp_res", hidden + last_row * D, D);
     }
 
     for (int s = 0; s < S; s++) {
@@ -294,7 +340,7 @@ int moss_gpt2_forward(
         memcpy(hidden + s * D, x_ln + s * D, (size_t)D * sizeof(float));
     }
     apply_attn_mask_scale_rows(hidden, attn_mask, S, D);
-    if (dbg_this_call) log_row_stats("output_ln_f", call_idx, nL, hidden + last_row * D, D);
+    if (dbg_this_call) log_row_stats(stack, call_idx, nL, "output_ln_f", hidden + last_row * D, D);
 
     free(rowqkv);
     free(pos_ids);

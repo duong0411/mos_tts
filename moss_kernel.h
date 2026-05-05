@@ -55,4 +55,10 @@ void moss_apply_rope_inplace(
     int head_dim
 );
 
+/* Audio-tokenizer FP32 compute helpers (shared kernels). */
+void moss_linear_f32(float *y, const float *W, const float *x, int out_dim, int in_dim);
+void moss_matvec_bias_f32(float *y, const float *W, const float *b, const float *x, int rows, int cols);
+void moss_build_weightnorm_matrix_f32(float *W_eff, const float *g, const float *v, int out_dim, int in_dim);
+void moss_batch_mm_nt_f32(const float *X, const float *W, float *Y, int T, int out_dim, int in_dim);
+
 #endif

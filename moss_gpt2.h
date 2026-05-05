@@ -22,6 +22,7 @@ typedef struct {
  * Forward GPT-2 stack (no dropout). hidden [S * D] in/out.
  * attn_mask: length S, 1 = keep position, 0 = masked (zero output for that row).
  * scratch: must hold at least 10 * S * D + 3 * S * S floats (caller passes size).
+ * dbg_stack_id: short label for stderr logs (MOSS_DEBUG_LAYER_STATS); NULL or "" -> "gpt2".
  */
 int moss_gpt2_forward(
     const moss_gpt2_stack_t *stk,
@@ -30,7 +31,8 @@ int moss_gpt2_forward(
     int S,
     const unsigned char *attn_mask,
     float *scratch,
-    size_t scratch_elems
+    size_t scratch_elems,
+    const char *dbg_stack_id
 );
 
 #endif
