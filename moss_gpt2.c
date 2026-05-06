@@ -346,3 +346,132 @@ int moss_gpt2_forward(
     free(pos_ids);
     return 0;
 }
+
+int moss_gpt2_kv_cache_init(
+    moss_gpt2_kv_cache_t *cache,
+    int n_layer,
+    int max_seq,
+    int D
+) {
+    if (!cache || n_layer <= 0 || max_seq <= 0 || D <= 0) return -1;
+    memset(cache, 0, sizeof(*cache));
+    size_t n = (size_t)n_layer * (size_t)max_seq * (size_t)D;
+    cache->k_cache = (float *)malloc(n * sizeof(float));
+    cache->v_cache = (float *)malloc(n * sizeof(float));
+    if (!cache->k_cache || !cache->v_cache) {
+        free(cache->k_cache);
+        free(cache->v_cache);
+        memset(cache, 0, sizeof(*cache));
+        return -2;
+    }
+    cache->n_layer = n_layer;
+    cache->max_seq = max_seq;
+    cache->D = D;
+    cache->cur_seq = 0;
+    return 0;
+}
+
+void moss_gpt2_kv_cache_reset(moss_gpt2_kv_cache_t *cache) {
+    if (!cache) return;
+    cache->cur_seq = 0;
+}
+
+void moss_gpt2_kv_cache_free(moss_gpt2_kv_cache_t *cache) {
+    if (!cache) return;
+    free(cache->k_cache);
+    free(cache->v_cache);
+    memset(cache, 0, sizeof(*cache));
+}
+
+int moss_gpt2_forward_step(
+    const moss_gpt2_stack_t *stk,
+    const moss_run_config_t *cfg,
+    const float *input_embed,
+    moss_gpt2_kv_cache_t *cache,
+    float *out_hidden
+) {
+    if (!stk || !cfg || !input_embed || !cache || !out_hidden) return -1;
+    const int D = cfg->n_embd;
+    const int H = cfg->n_head;
+    const int Dh = D / H;
+    const int I = cfg->n_inner;
+    if (Dh * H != D) return -2;
+    if (cache->D != D || cache->n_layer != stk->n_layer || cache->cur_seq >= cache->max_seq) return -3;
+
+    const int pos = cache->cur_seq;
+    float *x = (float *)malloc((size_t)D * sizeof(float));
+    float *x_ln = (float *)malloc((size_t)D * sizeof(float));
+    float *q = (float *)malloc((size_t)D * sizeof(float));
+    float *k = (float *)malloc((size_t)D * sizeof(float));
+    float *v = (float *)malloc((size_t)D * sizeof(float));
+    float *attn_out = (float *)malloc((size_t)D * sizeof(float));
+    float *rowscores = (float *)malloc((size_t)(pos + 1) * sizeof(float));
+    float *mlp_h = (float *)malloc((size_t)I * sizeof(float));
+    float *proj = (float *)malloc((size_t)D * sizeof(float));
+    float *cos = (float *)malloc((size_t)Dh * sizeof(float));
+    float *sin = (float *)malloc((size_t)Dh * sizeof(float));
+    int pos_id[1] = {pos};
+    if (!x || !x_ln || !q || !k || !v || !attn_out || !rowscores || !mlp_h || !proj || !cos || !sin) {
+        free(x); free(x_ln); free(q); free(k); free(v); free(attn_out);
+        free(rowscores); free(mlp_h); free(proj); free(cos); free(sin);
+        return -4;
+    }
+    memcpy(x, input_embed, (size_t)D * sizeof(float));
+
+    for (int li = 0; li < stk->n_layer; li++) {
+        const moss_gpt2_layer_w_t *w = &stk->layers[li];
+        moss_layernorm_bf16(x_ln, x, w->ln1w, w->ln1b, D, cfg->layer_norm_epsilon);
+        float rowqkv[3 * 2048];
+        if (3 * D > (int)(sizeof(rowqkv) / sizeof(rowqkv[0]))) {
+            free(x); free(x_ln); free(q); free(k); free(v); free(attn_out);
+            free(rowscores); free(mlp_h); free(proj); free(cos); free(sin);
+            return -5;
+        }
+        moss_gemv_bf16_nt_bias(rowqkv, w->c_attn_w, w->c_attn_b, x_ln, 3 * D, D);
+        memcpy(q, rowqkv, (size_t)D * sizeof(float));
+        memcpy(k, rowqkv + D, (size_t)D * sizeof(float));
+        memcpy(v, rowqkv + 2 * D, (size_t)D * sizeof(float));
+        moss_rope_cos_sin(cos, sin, pos_id, 1, Dh, cfg->rope_base);
+        moss_apply_rope_inplace(q, cos, sin, 1, H, Dh);
+        moss_apply_rope_inplace(k, cos, sin, 1, H, Dh);
+
+        float *kc = cache->k_cache + ((size_t)li * cache->max_seq + (size_t)pos) * D;
+        float *vc = cache->v_cache + ((size_t)li * cache->max_seq + (size_t)pos) * D;
+        memcpy(kc, k, (size_t)D * sizeof(float));
+        memcpy(vc, v, (size_t)D * sizeof(float));
+
+        memset(attn_out, 0, (size_t)D * sizeof(float));
+        const float scale = 1.0f / sqrtf((float)Dh);
+        for (int h = 0; h < H; h++) {
+            const float *qh = q + h * Dh;
+            for (int j = 0; j <= pos; j++) {
+                const float *kj = cache->k_cache + ((size_t)li * cache->max_seq + (size_t)j) * D + h * Dh;
+                float dot = 0.0f;
+                for (int d = 0; d < Dh; d++) dot += qh[d] * kj[d];
+                rowscores[j] = dot * scale;
+            }
+            moss_softmax_rows(rowscores, 1, pos + 1);
+            float *oh = attn_out + h * Dh;
+            for (int j = 0; j <= pos; j++) {
+                float p = rowscores[j];
+                if (p <= 0.0f) continue;
+                const float *vj = cache->v_cache + ((size_t)li * cache->max_seq + (size_t)j) * D + h * Dh;
+                for (int d = 0; d < Dh; d++) oh[d] += p * vj[d];
+            }
+        }
+
+        moss_gemv_bf16_nt_bias(proj, w->c_proj_w, w->c_proj_b, attn_out, D, D);
+        moss_vec_add(x, proj, D);
+        moss_layernorm_bf16(x_ln, x, w->ln2w, w->ln2b, D, cfg->layer_norm_epsilon);
+        moss_gemv_bf16_nt_bias(mlp_h, w->fc_in_w, w->fc_in_b, x_ln, I, D);
+        moss_gelu_new_inplace(mlp_h, I);
+        moss_gemv_bf16_nt_bias(proj, w->fc_out_w, w->fc_out_b, mlp_h, D, I);
+        moss_vec_add(x, proj, D);
+    }
+
+    moss_layernorm_bf16(out_hidden, x, stk->ln_f_w, stk->ln_f_b, D, cfg->layer_norm_epsilon);
+    cache->cur_seq++;
+    free(x); free(x_ln); free(q); free(k); free(v); free(attn_out);
+    free(rowscores); free(mlp_h); free(proj); free(cos); free(sin);
+    return 0;
+}

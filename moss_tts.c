@@ -53,27 +53,77 @@ static size_t scratch_elems_for_seq(int S, int D, int I, int Dh) {
     return (size_t)S * (size_t)D * 6u + (size_t)S + (size_t)S * (size_t)I + (size_t)S * (size_t)Dh * 2u;
 }
 
-static void moss_build_input_embeds(
+static int moss_stream_write_wav_header(FILE *f, int sample_rate, int n_channels) {
+    if (!f || sample_rate <= 0 || n_channels <= 0) return -1;
+    uint32_t data_bytes = 0x7FFFFFFFu;
+    uint32_t riff_size = 36u + data_bytes;
+    uint32_t fmt_chunk = 16u;
+    uint16_t audio_format = 1u;
+    uint16_t num_channels = (uint16_t)n_channels;
+    uint32_t byte_rate = (uint32_t)(sample_rate * n_channels * (int)sizeof(int16_t));
+    uint16_t block_align = (uint16_t)(n_channels * (int)sizeof(int16_t));
+    uint16_t bits = 16u;
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    fwrite(&fmt_chunk, 4, 1, f);
+    fwrite(&audio_format, 2, 1, f);
+    fwrite(&num_channels, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+    return 0;
+}
+
+static int moss_stream_finalize_wav_header(FILE *f, int total_samples) {
+    if (!f || total_samples < 0) return -1;
+    uint32_t data_bytes = (uint32_t)((uint64_t)total_samples * sizeof(int16_t));
+    uint32_t riff_size = 36u + data_bytes;
+    if (fseek(f, 4, SEEK_SET) != 0) return -1;
+    fwrite(&riff_size, 4, 1, f);
+    if (fseek(f, 40, SEEK_SET) != 0) return -1;
+    fwrite(&data_bytes, 4, 1, f);
+    if (fseek(f, 0, SEEK_END) != 0) return -1;
+    return 0;
+}
+
+static int moss_stream_append_pcm16(FILE *f, const float *samples, int n_samples) {
+    if (!f || !samples || n_samples <= 0) return -1;
+    int16_t *pcm = (int16_t *)malloc((size_t)n_samples * sizeof(int16_t));
+    if (!pcm) return -1;
+    for (int i = 0; i < n_samples; i++) {
+        float x = samples[i];
+        if (x > 1.0f) x = 1.0f;
+        if (x < -1.0f) x = -1.0f;
+        pcm[i] = (int16_t)(x * 32767.0f);
+    }
+    fwrite(pcm, sizeof(int16_t), (size_t)n_samples, f);
+    fflush(f);
+    free(pcm);
+    return 0;
+}
+
+static void moss_build_input_embed_row(
     const moss_weight_bundle_t *w,
     const moss_run_config_t *cfg,
-    const int *joint,
-    int S,
-    float *out
+    const int *joint_row,
+    float *out_row
 ) {
     const int D = cfg->n_embd;
     const int pad = cfg->audio_pad_token_id;
-    for (int s = 0; s < S; s++) {
-        float *row = out + s * D;
-        memset(row, 0, (size_t)D * sizeof(float));
-        int tid = joint[s * MOSS_N_COLS + 0];
-        const uint16_t *ew = w->wte + (size_t)tid * D;
-        for (int i = 0; i < D; i++) row[i] += moss_bf16_to_f32(ew[i]);
-        for (int c = 0; c < cfg->n_vq; c++) {
-            int aid = joint[s * MOSS_N_COLS + 1 + c];
-            if (aid == pad) continue;
-            const uint16_t *aw = w->audio_emb[c] + (size_t)aid * D;
-            for (int i = 0; i < D; i++) row[i] += moss_bf16_to_f32(aw[i]);
-        }
+    memset(out_row, 0, (size_t)D * sizeof(float));
+    int tid = joint_row[0];
+    const uint16_t *ew = w->wte + (size_t)tid * D;
+    for (int i = 0; i < D; i++) out_row[i] += moss_bf16_to_f32(ew[i]);
+    for (int c = 0; c < cfg->n_vq; c++) {
+        int aid = joint_row[1 + c];
+        if (aid == pad) continue;
+        const uint16_t *aw = w->audio_emb[c] + (size_t)aid * D;
+        for (int i = 0; i < D; i++) out_row[i] += moss_bf16_to_f32(aw[i]);
     }
 }
 
@@ -784,22 +834,23 @@ int moss_tts_generate_codes(
     size_t base_S = (size_t)(has_prompt_audio ? (P_pre + Tpa + P_suf) : (P + 1 + Tpa));
     size_t max_S = base_S + (size_t)max_frames;
     if (max_S > (size_t)MOSS_MAX_JOINT_ROWS) max_S = MOSS_MAX_JOINT_ROWS;
-    size_t need_global = scratch_elems_for_seq((int)max_S, D, I, Dh);
     const int local_max_S = 1 + 1 + cfg->n_vq;
     size_t need_local = scratch_elems_for_seq(local_max_S, D, I, Dh);
-    size_t scratch_elems = need_global > need_local ? need_global : need_local;
+    size_t scratch_elems = need_local;
 
     float *scratch = (float *)malloc(scratch_elems * sizeof(float));
-    float *hidden = (float *)malloc((size_t)MOSS_MAX_JOINT_ROWS * D * sizeof(float));
-    unsigned char *mask = (unsigned char *)malloc((size_t)MOSS_MAX_JOINT_ROWS);
+    float *global_in = (float *)malloc((size_t)D * sizeof(float));
+    float *global_last = (float *)malloc((size_t)D * sizeof(float));
     float *loc = (float *)malloc((size_t)local_max_S * D * sizeof(float));
     float *loc_run = (float *)malloc((size_t)local_max_S * D * sizeof(float));
     unsigned char *mask_loc = (unsigned char *)malloc((size_t)local_max_S);
+    moss_gpt2_kv_cache_t global_kv;
+    int kv_ok = 0;
 
-    if (!scratch || !hidden || !mask || !loc || !loc_run || !mask_loc) {
+    if (!scratch || !global_in || !global_last || !loc || !loc_run || !mask_loc) {
         free(scratch);
-        free(hidden);
-        free(mask);
+        free(global_in);
+        free(global_last);
         free(loc);
         free(loc_run);
         free(mask_loc);
@@ -811,6 +862,31 @@ int moss_tts_generate_codes(
 
     fprintf(stderr, "[moss_tts] starting autoregressive loop (seq grows each frame; long prompts are slow)\n");
     fflush(stderr);
+    if (moss_gpt2_kv_cache_init(&global_kv, w->global.n_layer, (int)max_S, D) != 0) {
+        free(scratch);
+        free(global_in);
+        free(global_last);
+        free(loc);
+        free(loc_run);
+        free(mask_loc);
+        free(joint);
+        return -6;
+    }
+    kv_ok = 1;
+    for (int t = 0; t < S; t++) {
+        moss_build_input_embed_row(w, cfg, joint + t * MOSS_N_COLS, global_in);
+        if (moss_gpt2_forward_step(&w->global, cfg, global_in, &global_kv, global_last) != 0) {
+            moss_gpt2_kv_cache_free(&global_kv);
+            free(scratch);
+            free(global_in);
+            free(global_last);
+            free(loc);
+            free(loc_run);
+            free(mask_loc);
+            free(joint);
+            return -7;
+        }
+    }
 
     uint64_t rng;
     if (params->rng_state != 0ull) {
@@ -836,40 +912,33 @@ int moss_tts_generate_codes(
         const char *vf = getenv("MOSS_VERBOSE_FRAMES");
         if (vf && vf[0] && strcmp(vf, "0") != 0) log_every_ar_frame = 1;
     }
+    const int stream_decode = (params->stream_decode != 0);
+    int stream_every = params->stream_every_frames;
+    if (stream_every < 1) stream_every = 1;
+    FILE *stream_wav = NULL;
+    int stream_total_samples = 0;
+    int stream_last_decoded_samples = 0;
 
     for (; frame < max_frames; frame++) {
         if (S >= MOSS_MAX_JOINT_ROWS) break;
 
         if (log_every_ar_frame || frame == 0 || ((frame + 1) % 25) == 0) {
-            fprintf(stderr, "[moss_tts] frame %d/%d joint_seq_len=%d (global GPT-2 forward)\n",
+            fprintf(stderr, "[moss_tts] frame %d/%d joint_seq_len=%d (global KV-step)\n",
                 frame + 1, max_frames, S);
         }
-
-        for (int i = 0; i < S; i++) mask[i] = 1;
-        moss_build_input_embeds(w, cfg, joint, S, hidden);
-        if (moss_gpt2_forward(&w->global, cfg, hidden, S, mask, scratch, scratch_elems, "global") != 0) {
-            free(scratch);
-            free(hidden);
-            free(mask);
-            free(loc);
-            free(loc_run);
-            free(mask_loc);
-            free(joint);
-            return -7;
-        }
-
-        const float *h_last = hidden + (size_t)(S - 1) * D;
+        const float *h_last = global_last;
 
         int S_loc = 1;
         memcpy(loc, h_last, (size_t)D * sizeof(float));
         if (moss_gpt2_forward(&w->local, cfg, loc, S_loc, mask_loc, scratch, scratch_elems, "local") != 0) {
             free(scratch);
-            free(hidden);
-            free(mask);
+            free(global_in);
+            free(global_last);
             free(loc);
             free(loc_run);
             free(mask_loc);
             free(joint);
+            if (kv_ok) moss_gpt2_kv_cache_free(&global_kv);
             return -8;
         }
 
@@ -956,12 +1025,13 @@ int moss_tts_generate_codes(
             memcpy(loc_run, loc, (size_t)S_loc * (size_t)D * sizeof(float));
             if (moss_gpt2_forward(&w->local, cfg, loc_run, S_loc, mask_loc, scratch, scratch_elems, "local") != 0) {
                 free(scratch);
-                free(hidden);
-                free(mask);
+                free(global_in);
+                free(global_last);
                 free(loc);
                 free(loc_run);
                 free(mask_loc);
                 free(joint);
+                if (kv_ok) moss_gpt2_kv_cache_free(&global_kv);
                 return -9;
             }
             int *ch_hist = NULL;
@@ -1014,7 +1084,54 @@ int moss_tts_generate_codes(
         int row = S * MOSS_N_COLS;
         joint[row + 0] = cfg->audio_assistant_slot_token_id;
         for (int c = 0; c < cfg->n_vq; c++) joint[row + 1 + c] = out_codes[frame * cfg->n_vq + c];
+        moss_build_input_embed_row(w, cfg, joint + row, global_in);
+        if (moss_gpt2_forward_step(&w->global, cfg, global_in, &global_kv, global_last) != 0) {
+            free(scratch);
+            free(global_in);
+            free(global_last);
+            free(loc);
+            free(loc_run);
+            free(mask_loc);
+            free(joint);
+            if (kv_ok) moss_gpt2_kv_cache_free(&global_kv);
+            return -10;
+        }
         S++;
+
+        if (stream_decode && params->stream_output_path && params->stream_output_path[0]
+            && (((frame + 1) % stream_every) == 0 || (frame + 1) == max_frames)) {
+            float *stream_samples = NULL;
+            int stream_n = 0;
+            int stream_ch = 1;
+            if (moss_audio_tok_decode_codes(
+                    &ctx->audio_tok,
+                    out_codes,
+                    frame + 1,
+                    params->sample_rate,
+                    &stream_samples,
+                    &stream_n,
+                    &stream_ch)
+                == 0
+                && stream_samples
+                && stream_n > 0) {
+                if (!stream_wav) {
+                    stream_wav = fopen(params->stream_output_path, "wb");
+                    if (stream_wav && moss_stream_write_wav_header(stream_wav, params->sample_rate, stream_ch) != 0) {
+                        fclose(stream_wav);
+                        stream_wav = NULL;
+                    }
+                }
+                int new_samples = stream_n - stream_last_decoded_samples;
+                if (stream_wav && new_samples > 0
+                    && moss_stream_append_pcm16(
+                           stream_wav, stream_samples + stream_last_decoded_samples, new_samples)
+                        == 0) {
+                    stream_last_decoded_samples = stream_n;
+                    stream_total_samples += new_samples;
+                }
+            }
+            free(stream_samples);
+        }
     }
 
     *out_frames = frame;
@@ -1027,13 +1144,22 @@ int moss_tts_generate_codes(
         fprintf(stderr, "[moss_tts] done: %d audio frame(s), stop_reason=loop_exit\n", frame);
     }
     fflush(stderr);
+    if (stream_wav) {
+        moss_stream_finalize_wav_header(stream_wav, stream_total_samples);
+        fclose(stream_wav);
+        fprintf(stderr,
+            "[moss_tts] stream finalized: %s samples=%d\n",
+            params->stream_output_path ? params->stream_output_path : "(null)",
+            stream_total_samples);
+    }
 
     free(scratch);
-    free(hidden);
-    free(mask);
+    free(global_in);
+    free(global_last);
     free(loc);
     free(loc_run);
     free(mask_loc);
+    if (kv_ok) moss_gpt2_kv_cache_free(&global_kv);
     free(joint);
     return 0;
 }

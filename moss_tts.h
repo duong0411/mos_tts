@@ -55,6 +55,10 @@ typedef struct {
     unsigned long long rng_seed; /* 0 = seed from time (non-deterministic) */
     /* infer.py voice_clone: chunk target token budget; <= 0 disables (single joint, full text). Default 75. */
     int voice_clone_max_text_tokens;
+    /* Stream decode during generation: rewrite stream_output_path every stream_every_frames. */
+    int stream_decode;
+    int stream_every_frames;
+    const char *stream_output_path;
     /* After each moss_tts_generate_codes: updated PRNG state (xoroshiro); 0 on entry = init from rng_seed/time. */
     unsigned long long rng_state;
 } moss_generate_params_t;

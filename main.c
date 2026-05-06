@@ -6,43 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#ifndef _WIN32
-static int moss_is_windows_drive_path(const char *p) {
-    if (!p || p[0] == '\0' || p[1] != ':')
-        return 0;
-    return ((unsigned char)p[0] <= 127)
-        && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))
-        && (p[2] == '\\' || p[2] == '/');
-}
 
-/* C:\...\file.wav -> /mnt/c/.../file.wav for Linux/WSL. */
-static int moss_win_drive_path_to_wsl(const char *src, char *dst, size_t cap) {
-    if (!dst || cap < 8) return -1;
-    dst[0] = '\0';
-    if (!moss_is_windows_drive_path(src)) return -1;
-    unsigned char drv = (unsigned char)tolower((unsigned char)src[0]);
-    size_t w = 0;
-    if (snprintf(dst, cap, "/mnt/%c", drv) >= (int)cap) return -1;
-    w = strlen(dst);
-    size_t j = 3;
-    int last_was_slash = 1;
-    for (; src[j] && w + 2 < cap; j++) {
-        char c = src[j];
-        if (c == '\\' || c == '/') {
-            if (!last_was_slash) dst[w++] = '/';
-            last_was_slash = 1;
-        } else {
-            dst[w++] = c;
-            last_was_slash = 0;
-        }
-    }
-    dst[w] = '\0';
-    return 0;
-}
-#endif
-
-/* CRLF pasted from Windows consoles leaves '\r' in argv (e.g. --fill-to-max\r -> unknown flag). */
 static void moss_argv_strip_tail_cr(int argc, char **argv) {
     if (!argv) return;
     for (int i = 1; i < argc; i++) {
@@ -55,41 +21,30 @@ static void moss_argv_strip_tail_cr(int argc, char **argv) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s --model-dir DIR (--text TEXT | --text-file PATH) --out out.wav [options]\n"
-        "  (--output is an alias for --out)\n"
+        "Usage: %s --model-dir DIR --text TEXT --out out.wav [options]\n"
         "Options:\n"
         "  --prompt-audio-path PATH  Reference audio (PCM RIFF/WAVE or any format ffmpeg can read; see MOSS_FFMPEG)\n"
-        "  --prompt-audio-codes FILE  Precomputed VQ text file (line1=T, then T lines of 16 ints)\n"
         "  --max-new-frames N  Maximum generated frames per chunk (default: %d, same as infer.py)\n"
-        "  --frames N        Alias for --max-new-frames (upper cap; model may stop sooner on audio_end)\n"
         "  --min-frames N    Ignore end token until N frames (default: 0; infer.py has no minimum)\n"
-        "  --fill-to-max     Ignore end until --frames is reached (steady length for long text)\n"
-        "                     (aliases: --fill-to_max --fill_to_max)\n"
         "  --sample-rate N   Output sample rate (default: 48000)\n"
         "  --backend NAME    auto|avx2|neon|generic (default: auto; AVX2/NEON reserved, use BLAS when built with it)\n"
-        "  --do-sample 0|1   1=text assistant/end sampled like infer.py (default: 1); 0=greedy 2-way\n"
-        "  --text-temperature F  Temperature for that 2-way text step (default: 1.0, infer.py resolve_sampling_kwargs)\n"
+        "  --do-sample 0|1   1=text assistant/end sampled (default: 1); 0=greedy 2-way\n"
+        "  --text-temperature F  Temperature for that 2-way text step (default: 1.0)\n"
         "  --text-top-p F    Text nucleus top-p for assistant-vs-end step (default: 1.0)\n"
-        "  --text-top-k N    Text top-k for that step (default: 50; only 1 vs 2 matter for 2-way head)\n"
-        "  --text STRING     Raw UTF-8 (infer.py also normalizes text unless you match it via --text-file)\n"
-        "  --text-file PATH  UTF-8 text file path only (not inline Chinese; use --text for that)\n"
-        "                     (recommended: tools/prepare_infer_text_for_cpp.py > file.txt)\n"
+        "  --text-top-k N    Text top-k for assistant-vs-end step (default: 50)\n"
+        "  --text STRING     Raw UTF-8 text input.\n"
         "  --audio-temperature F  Audio token sampling temperature (default: 0.8)\n"
         "  --audio-top-p F   Audio nucleus sampling top-p in (0,1] (default: 0.95)\n"
         "  --audio-top-k N   Audio top-k sampling (default: 25)\n"
         "  --audio-repetition-penalty F  Audio repetition penalty >= 1.0 (default: 1.2)\n"
+        "  --repetition-penalty F  Alias for --audio-repetition-penalty\n"
         "  --end-token-logit-bias F  Additive bias on audio_end logit (default: 0.0; >0 stops earlier)\n"
         "  --voice-clone-max-text-tokens N  Pocket-tts chunking like infer.py (default: 75; <=0 disables)\n"
         "  --dump-codes FILE  Dump generated audio token ids (line1=frames, then 16 ints per line)\n"
-        "  --seed U          RNG seed (unsigned); 0 = auto (time-based). Omit flag for same auto behavior.\n"
-        "Environment:\n"
-        "  MOSS_VERBOSE_FRAMES=1  Log every AR frame (default: first + every 25th; less stderr I/O)\n"
-        "  MOSS_DEBUG_LAYER_STATS=1  Per-GPT2-forward: last token row stats after each block + final ln_f\n"
-        "  MOSS_DEBUG_LAYER_STATS_VERBOSE=1  Also ln1, attn pre-proj, ln2, MLP gelu, MLP out (same row)\n"
-        "  MOSS_DEBUG_LAYER_CALLS=N  Only first N moss_gpt2_forward invocations (default 1; raise to trace more)\n"
-        "  MOSS_DEBUG_BLOCK0_COMPONENTS=1  Extra substages for stack call 1 layer 0 only\n"
-        "  MOSS_DEBUG_ATTN_LAYER0=1  Pre-softmax attn stats layer0 head0 last query row (call 1)\n"
-        "  MOSS_DEBUG_FIRST_STEP=1  Frame-0 logits/hidden stats in moss_tts (match cpp/tools log_python_*.py)\n",
+        "  --stream           Stream audio (decode during generation)\n"
+        "  --stream-every N   Stream decode cadence in frames (default: 8)\n"
+        "  --threads N        Set OPENBLAS/OMP threads (default: keep runtime default)\n"
+        "  --seed U          RNG seed (unsigned); 0 = auto (time-based). Omit flag for same auto behavior.\n",
         argv0,
         MOSS_DEFAULT_MAX_NEW_FRAMES);
 }
@@ -114,74 +69,7 @@ static int moss_append_zero_pcm(float **acc, int *acc_n, int nfloats) {
     return 0;
 }
 
-static int dump_codes_txt(const char *path, const int *codes, int n_frames) {
-    if (!path || !codes || n_frames < 0) return -1;
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    fprintf(f, "%d\n", n_frames);
-    for (int t = 0; t < n_frames; t++) {
-        for (int q = 0; q < 16; q++) {
-            if (q > 0) fputc(' ', f);
-            fprintf(f, "%d", codes[t * 16 + q]);
-        }
-        fputc('\n', f);
-    }
-    fclose(f);
-    return 0;
-}
 
-/* Read UTF-8 file into a heap buffer (NUL-terminated), max MOSS_MAX_TEXT_LEN-1 bytes of payload. */
-static char *moss_read_text_payload(const char *path) {
-    if (!path) return NULL;
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[moss_tts] cannot open --text-file %s: %s\n", path, strerror(errno));
-        if (errno == ENOENT) {
-            fprintf(stderr,
-                "[moss_tts] hint: --text-file is a path to a UTF-8 file on disk, not the sentence itself. "
-                "Use --text \"…\" for inline UTF-8, or echo -n '…' > tmp.txt && --text-file tmp.txt\n");
-        }
-        return NULL;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        fprintf(stderr, "[moss_tts] fseek failed on %s\n", path);
-        return NULL;
-    }
-    long sz = ftell(f);
-    if (sz < 0) {
-        fclose(f);
-        fprintf(stderr, "[moss_tts] ftell failed on %s\n", path);
-        return NULL;
-    }
-    if (sz > (long)MOSS_MAX_TEXT_LEN - 1) {
-        fclose(f);
-        fprintf(stderr,
-            "[moss_tts] --text-file too large (%ld bytes); max is %d\n",
-            sz,
-            MOSS_MAX_TEXT_LEN - 1);
-        return NULL;
-    }
-    rewind(f);
-    char *buf = (char *)malloc((size_t)sz + 1);
-    if (!buf) {
-        fclose(f);
-        fprintf(stderr, "[moss_tts] OOM reading %s\n", path);
-        return NULL;
-    }
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    buf[n] = '\0';
-    if (n >= 3 && (unsigned char)buf[0] == 0xef && (unsigned char)buf[1] == 0xbb && (unsigned char)buf[2] == 0xbf) {
-        memmove(buf, buf + 3, n - 2);
-        n -= 3;
-        buf[n] = '\0';
-    }
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
-        buf[--n] = '\0';
-    }
-    return buf;
-}
 
 static moss_backend_t parse_backend(const char *s) {
     if (strcmp(s, "avx2") == 0) return MOSS_BACKEND_AVX2;
@@ -199,10 +87,9 @@ int main(int argc, char **argv) {
     }
     const char *model_dir = NULL;
     const char *text = NULL;
-    char *text_file_owned = NULL;
     const char *out = NULL;
-    const char *dump_codes_path = NULL;
     const char *prompt_audio_input_path = NULL;
+    int num_threads = 0;
     moss_backend_t backend = MOSS_BACKEND_AUTO;
     moss_generate_params_t params = {
         .max_new_frames = MOSS_DEFAULT_MAX_NEW_FRAMES,
@@ -221,31 +108,20 @@ int main(int argc, char **argv) {
         .end_token_logit_bias = 0.0f,
         .rng_seed = 0,
         .voice_clone_max_text_tokens = 75,
+        .stream_decode = 0,
+        .stream_every_frames = 8,
+        .stream_output_path = NULL,
         .rng_state = 0,
     };
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) text = argv[++i];
-        else if (strcmp(argv[i], "--text-file") == 0 && i + 1 < argc) {
-            const char *tf = argv[++i];
-#ifndef _WIN32
-            static char wsl_tf[768];
-            if (moss_win_drive_path_to_wsl(tf, wsl_tf, sizeof(wsl_tf)) == 0) tf = wsl_tf;
-#endif
-            free(text_file_owned);
-            text_file_owned = moss_read_text_payload(tf);
-            if (!text_file_owned) return 3;
-            text = text_file_owned;
-        }
         else if ((strcmp(argv[i], "--out") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc)
             out = argv[++i];
-        else if ((strcmp(argv[i], "--frames") == 0 || strcmp(argv[i], "--max-new-frames") == 0) && i + 1 < argc)
+        else if (strcmp(argv[i], "--max-new-frames") == 0 && i + 1 < argc)
             params.max_new_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "--min-frames") == 0 && i + 1 < argc) params.min_frames = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--fill-to-max") == 0 || strcmp(argv[i], "--fill-to_max") == 0
-            || strcmp(argv[i], "--fill_to_max") == 0)
-            params.fill_to_max = 1;
         else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) params.sample_rate = atoi(argv[++i]);
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) backend = parse_backend(argv[++i]);
         else if (strcmp(argv[i], "--do-sample") == 0 && i + 1 < argc) params.do_sample = atoi(argv[++i]) != 0;
@@ -263,12 +139,18 @@ int main(int argc, char **argv) {
             params.audio_top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--audio-repetition-penalty") == 0 && i + 1 < argc)
             params.audio_repetition_penalty = (float)strtod(argv[++i], NULL);
+        else if (strcmp(argv[i], "--repetition-penalty") == 0 && i + 1 < argc)
+            params.audio_repetition_penalty = (float)strtod(argv[++i], NULL);
         else if (strcmp(argv[i], "--end-token-logit-bias") == 0 && i + 1 < argc)
             params.end_token_logit_bias = (float)strtod(argv[++i], NULL);
         else if (strcmp(argv[i], "--voice-clone-max-text-tokens") == 0 && i + 1 < argc)
             params.voice_clone_max_text_tokens = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--dump-codes") == 0 && i + 1 < argc)
-            dump_codes_path = argv[++i];
+        else if (strcmp(argv[i], "--stream") == 0)
+            params.stream_decode = 1;
+        else if (strcmp(argv[i], "--stream-every") == 0 && i + 1 < argc)
+            params.stream_every_frames = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
+            num_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             params.rng_seed = (unsigned long long)strtoull(argv[++i], NULL, 0);
         else if (strcmp(argv[i], "--prompt-audio-codes") == 0 && i + 1 < argc)
@@ -277,32 +159,19 @@ int main(int argc, char **argv) {
             prompt_audio_input_path = argv[++i];
         else {
             usage(argv[0]);
-            free(text_file_owned);
-            text_file_owned = NULL;
             return 1;
         }
     }
 
-#ifndef _WIN32
-    static char wsl_prompt_path[768];
-    if (prompt_audio_input_path
-        && moss_win_drive_path_to_wsl(prompt_audio_input_path, wsl_prompt_path, sizeof(wsl_prompt_path)) == 0) {
-        fprintf(stderr,
-            "[moss_tts] using WSL-style path %s\n",
-            wsl_prompt_path);
-        fflush(stderr);
-        prompt_audio_input_path = wsl_prompt_path;
-    }
-#endif
+
 
     if (!model_dir || !text || !out) {
         usage(argv[0]);
-        free(text_file_owned);
         return 1;
     }
     if (params.max_new_frames > 0 && params.max_new_frames < 16) {
         fprintf(stderr,
-            "[moss_tts] warning: --frames=%d is too short and often sounds empty; clamping to 16\n",
+            "[moss_tts] warning: --max-new-frames=%d is too short and often sounds empty; clamping to 16\n",
             params.max_new_frames);
         params.max_new_frames = 16;
     }
@@ -314,12 +183,23 @@ int main(int argc, char **argv) {
     if (params.audio_top_p <= 0.0f || params.audio_top_p > 1.0f) params.audio_top_p = 1.0f;
     if (params.text_top_p <= 0.0f || params.text_top_p > 1.0f) params.text_top_p = 1.0f;
     if (params.audio_repetition_penalty < 1.0f) params.audio_repetition_penalty = 1.0f;
+    if (params.stream_every_frames < 1) params.stream_every_frames = 1;
+    if (num_threads > 0) {
+        char tbuf[32];
+        snprintf(tbuf, sizeof(tbuf), "%d", num_threads);
+        setenv("OPENBLAS_NUM_THREADS", tbuf, 1);
+        setenv("GOTO_NUM_THREADS", tbuf, 1);
+        setenv("OMP_NUM_THREADS", tbuf, 1);
+        fprintf(stderr, "[moss_tts] threads=%d (OPENBLAS_NUM_THREADS/GOTO_NUM_THREADS/OMP_NUM_THREADS)\n", num_threads);
+    }
+    if (params.stream_decode) {
+        params.stream_output_path = out;
+    }
 
     fprintf(stderr, "[moss_tts] loading %s ...\n", model_dir);
     moss_tts_ctx_t *ctx = moss_tts_load(model_dir, backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
-        free(text_file_owned);
         return 2;
     }
     if (!moss_audio_tok_is_loaded(&ctx->audio_tok)) {
@@ -328,7 +208,6 @@ int main(int argc, char **argv) {
             "and model-*.safetensors (same layout as HF export). Speech decode is not available without it.\n",
             model_dir);
         moss_tts_unload(ctx);
-        free(text_file_owned);
         return 2;
     }
     fprintf(stderr,
@@ -347,7 +226,6 @@ int main(int argc, char **argv) {
     int n_frames = 0;
     if (!codes) {
         moss_tts_unload(ctx);
-        free(text_file_owned);
         return 3;
     }
 
@@ -365,7 +243,6 @@ int main(int argc, char **argv) {
                 "checkpoint/)\n");
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 4;
         }
         vc_chunks_owned = 1;
@@ -419,7 +296,6 @@ int main(int argc, char **argv) {
                 if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
                 free(codes);
                 moss_tts_unload(ctx);
-                free(text_file_owned);
                 return 3;
             }
             fprintf(stderr, "[moss_tts] inter-chunk pause %.3fs (%d interleaved samples)\n", psec, silence);
@@ -432,7 +308,6 @@ int main(int argc, char **argv) {
             if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 4;
         }
         total_frames += n_frames;
@@ -450,7 +325,6 @@ int main(int argc, char **argv) {
             if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 5;
         }
         if (!chunk_samples || chunk_n <= 0) {
@@ -459,7 +333,6 @@ int main(int argc, char **argv) {
             if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             const char *ph = getenv("MOSS_PLACEHOLDER_DECODE");
             int allow_placeholder = ph && ph[0] && strcmp(ph, "0") != 0;
             fprintf(stderr,
@@ -480,7 +353,6 @@ int main(int argc, char **argv) {
             if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 5;
         }
         if (moss_append_float_pcm(&samples, &n_samples, chunk_samples, chunk_n) != 0) {
@@ -490,7 +362,6 @@ int main(int argc, char **argv) {
             if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 3;
         }
         free(chunk_samples);
@@ -498,21 +369,6 @@ int main(int argc, char **argv) {
 
     if (vc_chunks_owned) moss_voice_clone_free_split(vc_chunks, n_vc_chunks);
 
-    if (dump_codes_path) {
-        if (n_vc_chunks > 1) {
-            fprintf(stderr,
-                "[moss_tts] warning: --dump-codes ignored for multi-chunk voice_clone (last chunk left in buffer only)\n");
-        } else if (dump_codes_txt(dump_codes_path, codes, n_frames) != 0) {
-            fprintf(stderr, "Failed to write code dump: %s\n", dump_codes_path);
-            free(samples);
-            free(codes);
-            moss_tts_unload(ctx);
-            free(text_file_owned);
-            return 7;
-        } else {
-            fprintf(stderr, "[moss_tts] wrote code dump to %s frames=%d\n", dump_codes_path, n_frames);
-        }
-    }
 
     if (!samples || n_samples <= 0) {
         const char *ph = getenv("MOSS_PLACEHOLDER_DECODE");
@@ -523,7 +379,6 @@ int main(int argc, char **argv) {
                 "test-tone fallback (not speech).\n");
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 5;
         }
         fprintf(stderr, "[moss_tts] MOSS_PLACEHOLDER_DECODE enabled: writing test-tone placeholder (not speech)\n");
@@ -531,7 +386,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Placeholder decode failed\n");
             free(codes);
             moss_tts_unload(ctx);
-            free(text_file_owned);
             return 5;
         }
         n_channels = 1;
@@ -543,7 +397,6 @@ int main(int argc, char **argv) {
         free(samples);
         free(codes);
         moss_tts_unload(ctx);
-        free(text_file_owned);
         return 6;
     }
 
@@ -556,7 +409,6 @@ int main(int argc, char **argv) {
     printf("backend=%s samples=%d channels=%d output=%s\n",
         moss_backend_name(ctx->backend), n_samples, n_channels, out);
 
-    free(text_file_owned);
     free(samples);
     free(codes);
     moss_tts_unload(ctx);

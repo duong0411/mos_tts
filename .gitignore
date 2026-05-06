@@ -17,4 +17,3 @@ tools/
 *.pyd
 __pycache__/
 scripts/
-

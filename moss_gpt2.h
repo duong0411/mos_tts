@@ -18,6 +18,15 @@ typedef struct {
     const uint16_t *ln_f_w, *ln_f_b;
 } moss_gpt2_stack_t;
 
+typedef struct {
+    float *k_cache; /* [n_layer * max_seq * D] */
+    float *v_cache; /* [n_layer * max_seq * D] */
+    int max_seq;
+    int cur_seq;
+    int D;
+    int n_layer;
+} moss_gpt2_kv_cache_t;
+
 /*
  * Forward GPT-2 stack (no dropout). hidden [S * D] in/out.
  * attn_mask: length S, 1 = keep position, 0 = masked (zero output for that row).
@@ -33,6 +42,25 @@ int moss_gpt2_forward(
     float *scratch,
     size_t scratch_elems,
     const char *dbg_stack_id
+);
+
+int moss_gpt2_kv_cache_init(
+    moss_gpt2_kv_cache_t *cache,
+    int n_layer,
+    int max_seq,
+    int D
+);
+
+void moss_gpt2_kv_cache_reset(moss_gpt2_kv_cache_t *cache);
+
+void moss_gpt2_kv_cache_free(moss_gpt2_kv_cache_t *cache);
+
+int moss_gpt2_forward_step(
+    const moss_gpt2_stack_t *stk,
+    const moss_run_config_t *cfg,
+    const float *input_embed,
+    moss_gpt2_kv_cache_t *cache,
+    float *out_hidden
 );
 
 #endif
